@@ -24,7 +24,7 @@ env:
 
 jobs:
   theos:
-    name: theos-package (iOS 17 / arm64 + arm64e)
+    name: theos-package (iOS 17 / arm64)
     runs-on: macos-15
     timeout-minutes: 30
 
@@ -128,9 +128,8 @@ jobs:
           DY="$(ls .theos/obj/AutoTapper.dylib 2>/dev/null || ls .theos/obj/*/AutoTapper.dylib | head -1)"
           echo "dylib: $DY"
 
-          echo "--- 架构（必须同时含 arm64 与 arm64e）---"
+          echo "--- 架构（侧载场景只需 arm64；arm64e 在新工具链+老系统上 ABI 不兼容，已停编）---"
           lipo -info "$DY" | tee /tmp/lipo.txt
-          grep -q 'arm64e' /tmp/lipo.txt || { echo "::error::缺少 arm64e 切片"; exit 1; }
           grep -q 'arm64'  /tmp/lipo.txt || { echo "::error::缺少 arm64 切片";  exit 1; }
 
           echo "--- 签名（ldid 写入的 entitlements，可为空）---"
