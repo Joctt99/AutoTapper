@@ -1,287 +1,51 @@
 //
-//  AutoTapper.xm — 插件入口（Logos）
+//  AutoTapper.xm — 注入入口（无钩子，纯 +load / %ctor 驱动）
 //
-//  这个文件负责「什么时候把插件装起来」，不负责具体点击逻辑：
-//    * SpringBoard 进程：等 applicationDidFinishLaunching 之后再装悬浮窗，
-//      避免和系统启动期的窗口创建打架（此时 connectedScenes 还是空的）。
-//    * 普通 App 进程（如果 filter plist 里加了这个 App）：立刻装，只用进程内后端。
+//  机制：%config(generator=internal) 产物为纯 ObjC 注入库，不依赖
+//  CydiaSubstrate/越狱框架，证书签名侧载可用。
 //
-//  %ctor 太早：SpringBoard 此时 UIKit 还没起来，UIScreen 可能返回 0x0，
-//  所以我们只在 %ctor 里做「符号探测 + 配置加载」，UI 留给 didFinishLaunching。
+//  启动链（iOS 26 实测结论）：
+//   * UIApplicationDidFinishLaunchingNotification 在 iOS 26 注入进程里不派发
+//   * UIApplicationDidBecomeActiveNotification 可靠派发
+//   * 3 秒兜底定时器
+//  全部触发来源写入日志，便于定位"哪条链路启动了"。
 //
-
-#import "YGCore.h"
-#import "YGPrivateAPI.h"
 
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <string.h>
+#import "WJTapCore.h"
 
-// 侧载（证书签名）场景没有 CydiaSubstrate，用 Logos internal 生成器：
-// 生成的 hook 直接走 Objective-C runtime，产物不依赖任何注入框架。
 %config(generator=internal)
 
-#pragma mark - 前向声明
+static BOOL gStarted = NO;
 
-// 定义在文件末尾（%hook 之后），这里先声明，避免 C 的「先声明后使用」报错
-static void YGInstallOrientationHook(void);
-
-#pragma mark - 引导
-
-// 注意：YGBootstrap 的 @interface 声明在 YGCore.h 里，这里不要再声明一遍，
-// 否则 clang 报 "duplicate interface definition for class 'YGBootstrap'"。
-
-@implementation YGBootstrap
-
-+ (instancetype)shared {
-    static YGBootstrap *s = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [YGBootstrap new]; });
-    return s;
+static void startTap(NSString *reason) {
+    if (gStarted) return;
+    gStarted = YES;
+    [[WJTap shared] startWithReason:reason];
 }
-
-- (BOOL)isSpringBoard {
-    NSString *bid = [NSBundle mainBundle].bundleIdentifier;
-    return [bid isEqualToString:@"com.apple.springboard"];
-}
-
-- (void)startWithReason:(NSString *)reason {
-    if (!NSThread.isMainThread) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self startWithReason:reason];
-        });
-        return;
-    }
-    if (_started) return;
-    _started = YES;
-
-    YGLOG(@"==== AutoTapper bootstrap: %@ (springboard=%d) ====",
-          reason, [self isSpringBoard]);
-    // 版本标记：每次编译都会变，用来核对用户实际装的是哪一版
-    YGLOG(@"build: %s %s arch=%s", __DATE__, __TIME__, "arm64");
-    YGLOG(@"device=%@ system=%@", [UIDevice currentDevice].model,
-          [UIDevice currentDevice].systemVersion);
-
-    // 1) 私有符号 / 后端探测（纯 dlsym，不碰 UIKit，绝对安全）
-    [[YGInjector shared] probe];
-    // 启动环境摘要：日志路径 + 后端可用矩阵，一眼定位问题
-    [YGLog logEnvironment];
-
-    // 2) 屏幕几何——逐步打桩：每一步都先打日志再执行，
-    //    若 BAD_ACCESS 崩溃，日志能精确停在出问题的那一行
-    YGLOG(@"boot: screen calc begin");
-    CGRect sb = CGRectZero;
-    CGFloat ss = 0;
-    @try { sb = YGScreenBounds(); }
-    @catch (NSException *e) { YGLOG(@"boot: bounds exception: %@", e); }
-    YGLOG(@"boot: bounds=%@", NSStringFromCGRect(sb));
-    @try { ss = YGScreenScale(); }
-    @catch (NSException *e) { YGLOG(@"boot: scale exception: %@", e); }
-    YGLOG(@"boot: scale=%.1f", ss);
-    YGLOG(@"screen=%@ scale=%.1f", NSStringFromCGRect(sb), ss);
-
-    // 3) 悬浮 UI（整体防御：iOS 26 上窗口/场景 API 崩点集中在这里，
-    //    抛出的 NSException 一律捕获，绝不让 App 闪退）
-    @try {
-        [[YGOverlayController shared] install];
-    } @catch (NSException *e) {
-        YGLOG(@"overlay install threw: %@", e);
-    }
-    YGLOG(@"boot: install returned");
-
-    // 3) 音量减键（仅 SpringBoard 有意义：App 进程里收不到系统级按键）
-    if ([self isSpringBoard]) {
-        [[YGVolumeButton shared] installWithHandler:^{
-            YGConfig *cfg = YGConfig.shared;
-            if (!cfg.volumeDownStops) return;
-            YGTapEngine *eng = [YGTapEngine shared];
-            if (eng.isRunning) {
-                YGLOG(@"音量减命中 → 停止");
-                [eng stop];
-                [[YGOverlayController shared] refreshCrosshair];
-                [[YGOverlayController shared] refreshPanel];
-            }
-        }];
-    }
-
-    // 4) 屏幕旋转 / 尺寸变化：准星与悬浮球要重新夹回可视区
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(onScreenChanged:)
-                                                 name:UIScreenDidConnectNotification
-                                               object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(onAppDidBecomeActive:)
-                                                 name:UIApplicationDidBecomeActiveNotification
-                                               object:nil];
-}
-
-- (void)stop {
-    if (!_started) return;
-    _started = NO;
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [[YGOverlayController shared] uninstall];
-    [[YGVolumeButton shared] uninstall];
-}
-
-- (void)onScreenChanged:(NSNotification *)n {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{
-        [[YGOverlayController shared] rebindScene];
-        [[YGOverlayController shared] refreshCrosshair];
-    });
-}
-
-- (void)onAppDidBecomeActive:(NSNotification *)n {
-    // 从后台回来 / App 切换：scene 可能变了，窗口要重新绑，否则悬浮球会消失
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(80 * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{
-        [[YGOverlayController shared] rebindScene];
-        [[YGOverlayController shared] refreshCrosshair];
-        [[YGOverlayController shared] refreshPanel];
-    });
-}
-
-@end
-
-#pragma mark - 构造：只做轻量准备
 
 %ctor {
     @autoreleasepool {
-        // 诊断锚点：NSLog 走系统日志（os_log），不需要沙盒文件权限。
-        // 若 dyld 加载失败，这条不会出现 → 问题在签名/注入路径；
-        // 若出现后仍闪退 → 问题在执行期，可据此定位。
-        NSLog(@"[AutoTapper] ctor begin");
-        // 配置先读出来（后续 UI 直接用）
-        [YGConfig shared];
-        // 符号探测（纯 dlsym，安全）
-        YGHIDResolve();
-
-        NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
-        YGLOG(@"tweak loaded into %@", bid.length ? bid : @"?");
-
-        // 非 SpringBoard 进程（plist 里额外加了 App 时才会走到）：
-        // 启动时机多级触发——didFinishLaunching / didBecomeActive / 3 秒兜底，
-        // 谁先到用谁。iOS 26 上 didFinishLaunching 通知可能不派发（日志显示
-        // 之前全靠 3 秒兜底），didBecomeActive 是 App 界面出现的可靠信号。
-        // 每级都带来源标记，方便从日志判断走了哪条路。
-        if (![bid isEqualToString:@"com.apple.springboard"]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                static dispatch_once_t once;
-                dispatch_once(&once, ^{
-                    __block id obsDL = nil;
-                    __block id obsBA = nil;
-                    void (^start)(NSString *src) = ^(NSString *src) {
-                        [[NSNotificationCenter defaultCenter] removeObserver:obsDL];
-                        [[NSNotificationCenter defaultCenter] removeObserver:obsBA];
-                        NSString *bid2 = [NSBundle mainBundle].bundleIdentifier ?: @"?";
-                        [[YGBootstrap shared] startWithReason:
-                            [NSString stringWithFormat:@"app %@ (%@)", bid2, src]];
-                    };
-                    obsDL = [[NSNotificationCenter defaultCenter]
-                        addObserverForName:UIApplicationDidFinishLaunchingNotification
-                                    object:nil queue:[NSOperationQueue mainQueue]
-                                usingBlock:^(NSNotification *n) { start(@"didFinishLaunching"); }];
-                    obsBA = [[NSNotificationCenter defaultCenter]
-                        addObserverForName:UIApplicationDidBecomeActiveNotification
-                                    object:nil queue:[NSOperationQueue mainQueue]
-                                usingBlock:^(NSNotification *n) { start(@"didBecomeActive"); }];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                                 (int64_t)(3 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        if (![YGBootstrap shared].started) start(@"3s-fallback");
-                    });
-                });
-            });
-        }
-    }
-}
-
-#pragma mark - SpringBoard 生命周期
-
-%hook SpringBoard
-
-- (void)applicationDidFinishLaunching:(id)application {
-    %orig;
-    // SpringBoard 启动完成 → scene 已就绪，可以建窗口了
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{
-        [[YGBootstrap shared] startWithReason:@"SpringBoard didFinishLaunching"];
-        // 方向变化钩子在 didFinishLaunching 之后才挂：
-        // 此时 SpringBoard 的类方法表已完整，探测才准
-        YGInstallOrientationHook();
-    });
-}
-
-- (void)applicationDidBecomeActive:(id)application {
-    %orig;
-    // 每次回前台都检查一下：如果窗口被系统回收（如内存警告），重建
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{
-        YGBootstrap *bs = [YGBootstrap shared];
-        if (!bs.started) {
-            [bs startWithReason:@"SpringBoard didBecomeActive"];
-        } else {
-            [[YGOverlayController shared] rebindScene];
-            [[YGOverlayController shared] refreshCrosshair];
-        }
-    });
-}
-
-%end
-
-#pragma mark - 屏幕方向变化（SpringBoard 侧，运行时探测）
-
-/*
- * 为什么不用 %hook SpringBoard 的 -_frontMostAppInterfaceOrientationChanged:：
- *   这个私有方法在 iOS 14 之后不一定存在（方向管理改到 FBSOrientationObserver /
- *   SBSceneManager 去了）。%hook 一个不存在的方法时 Logos 会用 class_addMethod
- *   装上去，系统永远不调用它 —— 钩子看起来装了，其实是死代码。
- *   签名如果是 v@:q（long long），和 v@:@ 传错还会有别的风险。
- *
- * 所以改成运行时探测：存在才挂，签名对才挂；都不行就退回
- *   UIApplicationDidBecomeActiveNotification + UIDeviceOrientationDidChangeNotification
- * 这两个一定可用（只是延迟略大）。
- */
-static void (*gOrigOrientationChanged)(id, SEL, long long) = NULL;
-
-static void YGOrientationChangedHook(id self, SEL _cmd, long long orientation) {
-    if (gOrigOrientationChanged) gOrigOrientationChanged(self, _cmd, orientation);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{
-        [[YGOverlayController shared] refreshCrosshair];
-        [[YGOverlayController shared] refreshPanel];
-    });
-}
-
-static void YGInstallOrientationHook(void) {
-    Class sb = NSClassFromString(@"SpringBoard");
-    SEL sel = NSSelectorFromString(@"_frontMostAppInterfaceOrientationChanged:");
-    Method m = sb ? class_getInstanceMethod(sb, sel) : NULL;
-
-    if (m) {
-        const char *enc = method_getTypeEncoding(m);
-        if (enc && strncmp(enc, "v@:q", 4) == 0) {
-            gOrigOrientationChanged =
-                (void (*)(id, SEL, long long))method_getImplementation(m);
-            method_setImplementation(m, (IMP)YGOrientationChangedHook);
-            YGLOG(@"方向变化 hook 已挂 (SB _frontMostAppInterfaceOrientationChanged:)");
-            return;
-        }
-        YGLOG(@"方向方法签名不符 (%s)，退回通知", enc ?: "?");
-    }
-
-    /* 兜底：设备方向 + 前台激活两条通知，一定能收到 */
-    YGLOG(@"方向变化改用通知观察");
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:@"UIDeviceOrientationDidChangeNotification"
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)),
+        // 观察者：didFinishLaunching（部分 iOS 版本派发）
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+                                                          startTap(@"didFinishLaunching");
+                                                      }];
+        // 观察者：didBecomeActive（iOS 26 注入进程实测可靠）
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+                                                          startTap(@"didBecomeActive");
+                                                      }];
+        // 兜底：3 秒后仍未启动则强行启动
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            [[YGOverlayController shared] refreshCrosshair];
-            [[YGOverlayController shared] refreshPanel];
-        });
-    }];
+                           if (!gStarted) {
+                               startTap(@"3s-fallback");
+                           }
+                       });
+    }
 }
-

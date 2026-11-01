@@ -1,0 +1,919 @@
+//
+//  WJTapCore.m — 连点器核心实现
+//
+//  还原自 libWJHook（arm64）反编译：
+//   - setupUI：红色圆形攻击按钮挂 keyWindow，可拖拽，三种攻击模式
+//   - createDotButtonsWithRadius:…：围绕攻击按钮的彩色圆形多点，可拖，点按即连点
+//   - 连点引擎：NSTimer 按 clickInterval 触发 scheduleClicks，逐点入 NSOperationQueue
+//     （随机 0~40ms 微延迟 + 主线程派发 simulateTapAtPoint）
+//   - simulateTapAtPoint:：keyWindow hitTest → UITouch KVC 构造 →
+//     UITouchesEvent（私有类，respondsToSelector 兜底）→ 直接派发 touchesBegan/Ended；
+//     命中 UIControl 则 sendActionsForControlEvents:UIControlEventTouchUpInside
+//   - 设置面板（UIScrollView 挂 keyWindow）：间隔/点数/点径/按钮大小/透明度/模式/隐藏/保存
+//   - 持久化：NSUserDefaults + Documents 位置 plist
+//   - 日志：Documents/AutoTapper.log（沿用既有轮转 256KB 方案）+ build 标记
+//
+//  已剥离：验证、授权码、支付、到期检查、截图上报、远程加载、socket、符号重绑定。
+//  进程内事件派发不依赖越狱，证书签名侧载 App 内即可工作。
+//
+
+#import "WJTapCore.h"
+#import <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>
+#import <math.h>
+#import <unistd.h>
+
+#pragma mark - 日志
+
+#define WJLOG(fmt, ...) [WJTapLog write:[NSString stringWithFormat:fmt, ##__VA_ARGS__]]
+
+@interface WJTapLog : NSObject
++ (void)write:(NSString *)line;
+@end
+
+@implementation WJTapLog
+
++ (NSString *)logPath {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [[paths firstObject] stringByAppendingPathComponent:@"AutoTapper.log"];
+}
+
++ (void)rotateIfNeeded {
+    NSString *p = [self logPath];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+    unsigned long long sz = [attr[NSFileSize] unsignedLongLongValue];
+    if (sz > 256 * 1024) {
+        NSString *old = [p stringByAppendingString:@".1"];
+        [fm removeItemAtPath:old error:nil];
+        [fm moveItemAtPath:p toPath:old error:nil];
+    }
+}
+
++ (void)write:(NSString *)line {
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    NSString *ts = [fmt stringFromDate:[NSDate date]];
+    NSString *full = [NSString stringWithFormat:@"%@ %@\n", ts, line];
+    @try {
+        [self rotateIfNeeded];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:[self logPath]];
+        if (!fh) {
+            [[NSFileManager defaultManager] createFileAtPath:[self logPath] contents:nil attributes:nil];
+            fh = [NSFileHandle fileHandleForWritingAtPath:[self logPath]];
+        }
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
+    NSLog(@"[AutoTapper] %@", line);
+}
+
+@end
+
+#pragma mark - 控件 tag（设置面板）
+
+typedef NS_ENUM(NSInteger, WJTapControlTag) {
+    WJTagIntervalSlider      = 1001,
+    WJTagDotCountSlider      = 1002,
+    WJTagDotSizeSlider       = 1003,
+    WJTagButtonSizeSlider    = 1004,
+    WJTagDotAlphaSlider      = 1005,
+    WJTagAttackAlphaSlider   = 1006,
+    WJTagSettingsAlphaSlider = 1007,
+    WJTagAttackModeSeg       = 1008,
+    WJTagHideSwitch          = 1009,
+    WJTagQuickMountSwitch    = 1010,
+    WJTagQuickReviveSwitch   = 1011,
+    WJTagQuickReturnSwitch   = 1012,
+    WJTagSaveButton          = 1013,
+    WJTagCloseButton         = 1014,
+};
+
+#pragma mark - WJTap
+
+@interface WJTap ()
+@property (nonatomic, strong) UIButton *attackButton;
+@property (nonatomic, strong) NSMutableArray<UIButton *> *dotButtons;
+@property (nonatomic, assign) BOOL isAttacking;
+@property (nonatomic, strong) NSTimer *clickTimer;
+@property (nonatomic, strong) NSOperationQueue *clickQueue;
+@property (nonatomic, strong) UIButton *settingsButton;
+@property (nonatomic, strong) UIScrollView *settingsPanel;
+@property (nonatomic, strong) UIPanGestureRecognizer *handlePanGesture;
+@property (nonatomic, strong) UIPanGestureRecognizer *settingsPanGesture;
+@property (nonatomic, assign) BOOL isVerified;
+
+// 设置项
+@property (nonatomic, assign) CGFloat clickInterval;       // 默认 0.1s
+@property (nonatomic, assign) NSInteger dotCount;          // 默认 6
+@property (nonatomic, assign) BOOL shouldHideButtons;      // 默认 NO
+@property (nonatomic, assign) CGFloat buttonSize;          // 默认 80
+@property (nonatomic, assign) NSInteger attackMode;        // 0=按住 1=切换 2=隐藏
+@property (nonatomic, assign) CGFloat dotAlpha;            // 默认 0.7
+@property (nonatomic, assign) CGFloat dotSize;             // 默认 30
+@property (nonatomic, assign) CGFloat settingsButtonAlpha; // 默认 1.0
+@property (nonatomic, assign) CGFloat attackButtonAlpha;   // 默认 1.0
+@property (nonatomic, assign) BOOL enableQuickMount;
+@property (nonatomic, assign) BOOL enableQuickReviveMount;
+@property (nonatomic, assign) BOOL enableQuickReturnCityMount;
+@end
+
+@implementation WJTap {
+    BOOL _started;
+    BOOL _retryScheduled;
+}
+
++ (instancetype)shared {
+    static WJTap *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [WJTap new]; });
+    return s;
+}
+
+#pragma mark - 启动
+
+- (void)startWithReason:(NSString *)reason {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self startWithReason:reason];
+        });
+        return;
+    }
+    if (_started) return;
+    _started = YES;
+
+    WJLOG(@"==== AutoTapper bootstrap: app %@ (%@) ====",
+          [NSBundle mainBundle].bundleIdentifier ?: @"?", reason);
+    WJLOG(@"build: %s %s arch=%s", __DATE__, __TIME__, "arm64");
+    WJLOG(@"device=%@ system=%@", [UIDevice currentDevice].model,
+          [UIDevice currentDevice].systemVersion);
+    WJLOG(@"log file: %@", [WJTapLog logPath]);
+
+    [self loadSettings];
+    [self setupUI];
+    [self setupThreadPool];
+    WJLOG(@"boot: install returned");
+}
+
+/// keyWindow 可能尚未就绪（启动早期），主线程重试最多 6 次（约 3 秒）
+- (void)retrySetupIfNeeded {
+    if (_started && ![UIApplication sharedApplication].keyWindow) {
+        if (_retryScheduled) return;
+        _retryScheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            self->_retryScheduled = NO;
+            if (![UIApplication sharedApplication].keyWindow) {
+                WJLOG(@"retry: keyWindow still nil, re-setup");
+                [self setupUI];
+                [self retrySetupIfNeeded];
+            }
+        });
+    }
+}
+
+#pragma mark - 悬浮 UI
+
+- (UIWindow *)hostWindow {
+    // 完全不碰 UIScreen（iOS 26 注入场景 +mainScreen 信号级崩溃，实测）。
+    // 只用 keyWindow；nil 时退回 windows.firstObject。
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return nil;
+    if (app.keyWindow) return app.keyWindow;
+    NSArray<UIWindow *> *wins = app.windows;
+    if (wins.count) return wins.firstObject;
+    return nil;
+}
+
+- (void)setupUI {
+    UIWindow *window = [self hostWindow];
+    if (!window) {
+        WJLOG(@"setupUI: no window yet, will retry");
+        [self retrySetupIfNeeded];
+        return;
+    }
+    WJLOG(@"setupUI: window=%@ bounds=%@", window, NSStringFromCGRect(window.bounds));
+
+    self.isVerified = YES;   // 无验证机制：始终视为已验证
+
+    // --- 攻击按钮（红色圆形） ---
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = CGRectMake(0, 0, self.buttonSize, self.buttonSize);
+    [btn setBackgroundColor:[UIColor colorWithRed:0.80 green:0.10 blue:0.10 alpha:0.90]];
+    btn.layer.cornerRadius = self.buttonSize / 2.0;
+    btn.layer.masksToBounds = YES;
+    btn.layer.borderWidth = 2.0;
+    btn.layer.borderColor = [UIColor whiteColor].CGColor;
+    [btn.titleLabel setFont:[UIFont boldSystemFontOfSize:26.0]];
+    [btn setTitle:@"攻" forState:UIControlStateNormal];
+    btn.alpha = self.attackButtonAlpha;
+    btn.center = CGPointMake(window.bounds.size.width / 2.0,
+                             window.bounds.size.height / 2.0 + 100);
+    self.attackButton = btn;
+
+    [self addDragHandleToAttackButton];
+    [self setupAttackButtonEvents];
+
+    [window addSubview:btn];
+    [window bringSubviewToFront:btn];
+
+    [self createSettingsButtonInWindow:window];
+    [self createDotButtonsWithRadius:100.0 dotSize:self.dotSize inWindow:window dotCount:self.dotCount];
+    [self loadPositionsFromFile];
+    [self updateButtonsVisibility];
+    WJLOG(@"setupUI: done dots=%ld", (long)self.dotButtons.count);
+}
+
+- (void)addDragHandleToAttackButton {
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                          action:@selector(handleDragHandlePan:)];
+    pan.maximumNumberOfTouches = 1;
+    [self.attackButton addGestureRecognizer:pan];
+    self.handlePanGesture = pan;
+}
+
+- (void)setupAttackButtonEvents {
+    [self.attackButton removeTarget:nil action:NULL forControlEvents:UIControlEventAllEvents];
+    if (self.attackMode == 2) {
+        self.attackButton.hidden = YES;   // 隐藏模式：不显示攻击按钮
+    } else if (self.attackMode == 1) {
+        [self.attackButton addTarget:self action:@selector(toggleAttackMode)
+                    forControlEvents:UIControlEventTouchUpInside];
+        [self updateAttackButtonAppearance];
+    } else {
+        [self.attackButton addTarget:self action:@selector(attackButtonTouchDown)
+                    forControlEvents:UIControlEventTouchDown];
+        [self.attackButton addTarget:self action:@selector(attackButtonTouchUp)
+                    forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside |
+                                        UIControlEventTouchCancel];
+    }
+}
+
+- (void)updateAttackButtonAppearance {
+    BOOL attacking = self.isAttacking;
+    [self.attackButton setTitle:attacking ? @"停" : @"攻" forState:UIControlStateNormal];
+    if (attacking) {
+        [self.attackButton setBackgroundColor:[UIColor colorWithRed:0.10 green:0.70 blue:0.20 alpha:0.90]];
+    } else {
+        [self.attackButton setBackgroundColor:[UIColor colorWithRed:0.80 green:0.10 blue:0.10 alpha:0.90]];
+    }
+}
+
+- (void)toggleAttackMode {
+    if (self.isAttacking) {
+        [self stopClicking];
+    } else {
+        [self startClicking];
+    }
+    [self updateAttackButtonAppearance];
+}
+
+- (void)attackButtonTouchDown {
+    WJLOG(@"attack down");
+    [self startClicking];
+    [self startDotAnimation];
+}
+
+- (void)attackButtonTouchUp {
+    WJLOG(@"attack up");
+    [self stopClicking];
+    [self stopDotAnimation];
+}
+
+#pragma mark - 设置按钮
+
+- (void)createSettingsButtonInWindow:(UIWindow *)window {
+    UIButton *sb = [UIButton buttonWithType:UIButtonTypeCustom];
+    CGFloat s = 40;
+    sb.frame = CGRectMake(0, 0, s, s);
+    [sb setBackgroundColor:[UIColor colorWithWhite:0.2 alpha:0.8]];
+    sb.layer.cornerRadius = s / 2.0;
+    sb.layer.masksToBounds = YES;
+    [sb setTitle:@"⚙" forState:UIControlStateNormal];
+    [sb.titleLabel setFont:[UIFont boldSystemFontOfSize:18.0]];
+    sb.alpha = self.settingsButtonAlpha;
+    sb.center = CGPointMake(window.bounds.size.width - 40,
+                            window.bounds.size.height / 2.0);
+    [sb addTarget:self action:@selector(showSettingsPanel)
+                 forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                          action:@selector(handleSettingsDrag:)];
+    pan.maximumNumberOfTouches = 1;
+    [sb addGestureRecognizer:pan];
+    self.settingsPanGesture = pan;
+    self.settingsButton = sb;
+    [window addSubview:sb];
+    [window bringSubviewToFront:sb];
+}
+
+- (void)handleSettingsDrag:(UIPanGestureRecognizer *)g {
+    UIView *sb = g.view;
+    CGPoint t = [g translationInView:sb.superview];
+    if (g.state == UIGestureRecognizerStateChanged) {
+        sb.center = CGPointMake(sb.center.x + t.x, sb.center.y + t.y);
+        [g setTranslation:CGPointZero inView:sb.superview];
+    } else if (g.state == UIGestureRecognizerStateEnded) {
+        [self savePositionsToFile];
+    }
+}
+
+#pragma mark - 圆形多点按钮
+
+- (void)createDotButtonsWithRadius:(CGFloat)radius dotSize:(CGFloat)dotSize
+                          inWindow:(UIWindow *)window dotCount:(NSInteger)count {
+    for (UIButton *old in self.dotButtons) {
+        [old removeFromSuperview];
+    }
+    self.dotButtons = [NSMutableArray array];
+    if (count < 1) count = 1;
+
+    CGFloat hueStep = (count > 1) ? (1.0 / count) : 0.0;
+    for (NSInteger i = 0; i < count; i++) {
+        UIButton *dot = [UIButton buttonWithType:UIButtonTypeCustom];
+        dot.frame = CGRectMake(0, 0, dotSize, dotSize);
+        CGFloat hue = hueStep * i;
+        [dot setBackgroundColor:[UIColor colorWithHue:hue saturation:0.8 brightness:0.9 alpha:1.0]];
+        dot.alpha = self.dotAlpha;
+        dot.layer.cornerRadius = dotSize / 2.0;
+        dot.layer.masksToBounds = YES;
+        dot.tag = (NSInteger)(i + 1);          // tag 从 1 起（原版语义：tag==1 为第一点）
+        [dot setTitle:[NSString stringWithFormat:@"%ld", (long)(i + 1)]
+             forState:UIControlStateNormal];
+        [dot.titleLabel setFont:[UIFont boldSystemFontOfSize:dotSize / 2.0]];
+        dot.titleLabel.alpha = self.dotAlpha;
+
+        CGFloat ang = (2.0 * M_PI / (CGFloat)count) * (CGFloat)i;
+        CGPoint ac = self.attackButton.center;
+        dot.center = CGPointMake(ac.x + cos(ang) * radius,
+                                 ac.y + sin(ang) * radius);
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                              action:@selector(handleDotPan:)];
+        pan.maximumNumberOfTouches = 1;
+        [dot addGestureRecognizer:pan];
+        [dot addTarget:self action:@selector(handleDotTap:)
+                     forControlEvents:UIControlEventTouchUpInside];
+
+        [window addSubview:dot];
+        [self.dotButtons addObject:dot];
+    }
+    [window bringSubviewToFront:self.attackButton];
+    [window bringSubviewToFront:self.settingsButton];
+}
+
+- (void)recreateDotButtons {
+    UIWindow *window = [self hostWindow];
+    if (window && self.attackButton) {
+        [self createDotButtonsWithRadius:100.0 dotSize:self.dotSize
+                               inWindow:window dotCount:self.dotCount];
+    }
+}
+
+- (void)handleDotTap:(UIButton *)dot {
+    NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{
+        // 后台线程：随机 0~40ms 微延迟（模拟人手节奏，避免瞬时全点）
+        usleep(arc4random_uniform(5) * 10000);
+        CGPoint p = [self dotCenterOnMain:dot];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self addScaleAnimationToButton:dot];
+            dot.userInteractionEnabled = NO;
+            [self simulateTapAtPoint:p];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                dot.userInteractionEnabled = YES;
+            });
+        });
+    }];
+    op.qualityOfService = NSQualityOfServiceUserInitiated;
+    [self.clickQueue addOperation:op];
+
+    // 隐藏模式（attackMode==2）：点任意非第一点，同时连点第一点
+    if (self.attackMode == 2 && dot.tag != 1 && self.dotButtons.count > 0) {
+        UIButton *first = self.dotButtons.firstObject;
+        NSBlockOperation *op2 = [NSBlockOperation blockOperationWithBlock:^{
+            usleep(arc4random_uniform(5) * 10000);
+            CGPoint p = [self dotCenterOnMain:first];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self simulateTapAtPoint:p];
+            });
+        }];
+        op2.qualityOfService = NSQualityOfServiceUserInitiated;
+        [self.clickQueue addOperation:op2];
+    }
+}
+
+- (CGPoint)dotCenterOnMain:(UIButton *)dot {
+    if ([NSThread isMainThread]) return dot.center;
+    __block CGPoint p = CGPointZero;
+    dispatch_sync(dispatch_get_main_queue(), ^{ p = dot.center; });
+    return p;
+}
+
+- (void)handleDotPan:(UIPanGestureRecognizer *)g {
+    UIView *dot = g.view;
+    CGPoint t = [g translationInView:dot.superview];
+    if (g.state == UIGestureRecognizerStateChanged) {
+        dot.center = CGPointMake(dot.center.x + t.x, dot.center.y + t.y);
+        [g setTranslation:CGPointZero inView:dot.superview];
+    } else if (g.state == UIGestureRecognizerStateEnded) {
+        [self savePositionsToFile];
+    }
+}
+
+- (void)handleDragHandlePan:(UIPanGestureRecognizer *)g {
+    UIView *btn = g.view;
+    CGPoint t = [g translationInView:btn.superview];
+    if (g.state == UIGestureRecognizerStateChanged) {
+        btn.center = CGPointMake(btn.center.x + t.x, btn.center.y + t.y);
+        [g setTranslation:CGPointZero inView:btn.superview];
+    } else if (g.state == UIGestureRecognizerStateEnded) {
+        [self savePositionsToFile];
+        // 攻击按钮动了，圆点围绕它重新排布
+        [self layoutDotButtonsInCircle];
+    }
+}
+
+- (void)layoutDotButtonsInCircle {
+    CGPoint ac = self.attackButton.center;
+    CGFloat radius = 100.0;
+    NSInteger count = (NSInteger)self.dotButtons.count;
+    for (NSInteger i = 0; i < count; i++) {
+        CGFloat ang = (2.0 * M_PI / (CGFloat)count) * (CGFloat)i;
+        self.dotButtons[i].center = CGPointMake(ac.x + cos(ang) * radius,
+                                                ac.y + sin(ang) * radius);
+    }
+}
+
+#pragma mark - 动画
+
+- (void)addScaleAnimationToButton:(UIButton *)btn {
+    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    anim.fromValue = @1.0;
+    anim.toValue = @0.6;
+    anim.duration = 0.1;
+    anim.autoreverses = YES;
+    anim.repeatCount = 1;
+    [btn.layer addAnimation:anim forKey:@"tapScale"];
+}
+
+- (void)startDotAnimation {
+    for (UIButton *dot in self.dotButtons) {
+        CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        anim.fromValue = @1.0;
+        anim.toValue = @1.25;
+        anim.duration = 0.35;
+        anim.autoreverses = YES;
+        anim.repeatCount = HUGE_VALF;
+        [dot.layer addAnimation:anim forKey:@"pulse"];
+    }
+}
+
+- (void)stopDotAnimation {
+    for (UIButton *dot in self.dotButtons) {
+        [dot.layer removeAnimationForKey:@"pulse"];
+    }
+}
+
+#pragma mark - 连点引擎
+
+- (void)setupThreadPool {
+    NSOperationQueue *q = [NSOperationQueue new];
+    q.maxConcurrentOperationCount = (NSInteger)[[NSProcessInfo processInfo] processorCount];
+    self.clickQueue = q;
+}
+
+- (void)startClicking {
+    if (self.clickTimer) {
+        [self.clickTimer invalidate];
+        self.clickTimer = nil;
+    }
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:self.clickInterval
+                                                      target:self
+                                                    selector:@selector(scheduleClicks)
+                                                    userInfo:nil
+                                                     repeats:YES];
+    self.clickTimer = timer;
+    self.isAttacking = YES;
+    WJLOG(@"clicking started interval=%.3f dots=%ld", self.clickInterval, (long)self.dotButtons.count);
+}
+
+- (void)scheduleClicks {
+    for (UIButton *dot in self.dotButtons) {
+        NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{
+            usleep(arc4random_uniform(5) * 10000);
+            CGPoint p = [self dotCenterOnMain:dot];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self simulateTapAtPoint:p];
+                if (dot.tag == 1) {
+                    WJLOG(@"click #1 at %@", NSStringFromCGPoint(p));
+                }
+            });
+        }];
+        op.qualityOfService = NSQualityOfServiceUserInitiated;
+        [self.clickQueue addOperation:op];
+    }
+}
+
+- (void)stopClicking {
+    if (self.clickTimer) {
+        [self.clickTimer invalidate];
+        self.clickTimer = nil;
+    }
+    [self.clickQueue cancelAllOperations];
+    self.isAttacking = NO;
+    WJLOG(@"clicking stopped");
+}
+
+#pragma mark - 触摸模拟（进程内事件派发）
+
+- (UIEvent *)createTouchesEvent {
+    @try {
+        Class cls = NSClassFromString(@"UITouchesEvent");
+        if (!cls) return nil;
+        id event = [[cls alloc] init];
+        SEL sel = NSSelectorFromString(@"_setTimestamp:");
+        if ([event respondsToSelector:sel]) {
+            // 注意：_setTimestamp: 参数是 double，必须用 NSInvocation 传值；
+            // performSelector:withObject: 传 NSNumber 会被当作指针解包成垃圾值。
+            NSMethodSignature *sig = [event methodSignatureForSelector:sel];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                inv.target = event;
+                inv.selector = sel;
+                double ts = CACurrentMediaTime();
+                [inv setArgument:&ts atIndex:2];
+                [inv invoke];
+            }
+        }
+        return event;
+    } @catch (NSException *e) {
+        WJLOG(@"createTouchesEvent ex: %@", e);
+        return nil;
+    }
+}
+
+/// 连点引擎是否命中自己悬浮控件（dot/攻击钮/设置钮）——命中则跳过，
+/// 避免 hitTest → sendActions → handleDotTap 的自触发循环刷屏/失控。
+- (BOOL)isOwnFloatingView:(UIView *)view {
+    if (!view) return NO;
+    if (view == self.attackButton || view == self.settingsButton) return YES;
+    for (UIButton *d in self.dotButtons) {
+        if (view == d) return YES;
+    }
+    return NO;
+}
+
+- (void)simulateTapAtPoint:(CGPoint)point {
+    if (!self.isVerified) return;
+    UIWindow *window = [self hostWindow];
+    if (!window) return;
+    UIView *hit = [window hitTest:point withEvent:nil];
+    if (!hit) return;
+    if ([self isOwnFloatingView:hit]) return;
+
+    if (![hit isKindOfClass:[UIControl class]]) {
+        @try {
+            UITouch *touch = [[UITouch alloc] init];
+            [touch setValue:@0 forKey:@"_phase"];                          // UITouchPhaseBegan
+            [touch setValue:hit forKey:@"_view"];
+            [touch setValue:@1 forKey:@"_tapCount"];
+            [touch setValue:[NSValue valueWithCGPoint:point] forKey:@"_locationInWindow"];
+            UIEvent *event = [self createTouchesEvent];
+            NSSet *touches = [NSSet setWithObject:touch];
+            [hit touchesBegan:touches withEvent:event];
+            [touch setValue:@3 forKey:@"_phase"];                          // UITouchPhaseEnded
+            [hit touchesEnded:touches withEvent:event];
+        } @catch (NSException *e) {
+            WJLOG(@"simulateTap ex: %@", e);
+        }
+    } else {
+        // 命中 UIControl：直接触发 TouchUpInside（如游戏内按钮）
+        @try {
+            [(UIControl *)hit sendActionsForControlEvents:UIControlEventTouchUpInside];
+        } @catch (NSException *e) {
+            WJLOG(@"simulateTap control ex: %@", e);
+        }
+    }
+}
+
+#pragma mark - 可见性
+
+- (void)updateButtonsVisibility {
+    if (self.shouldHideButtons) {
+        self.attackButton.hidden = YES;
+        for (UIButton *d in self.dotButtons) d.hidden = YES;
+    } else {
+        for (UIButton *d in self.dotButtons) d.hidden = NO;
+        if (self.attackMode == 2) {
+            self.attackButton.hidden = YES;
+        } else {
+            self.attackButton.hidden = NO;
+        }
+    }
+    self.settingsButton.hidden = NO;
+}
+
+#pragma mark - 设置面板
+
+- (void)showSettingsPanel {
+    UIWindow *window = [self hostWindow];
+    if (!window) return;
+    if (self.settingsPanel && self.settingsPanel.superview) {
+        [self.settingsPanel removeFromSuperview];
+        return;
+    }
+
+    CGFloat w = 280;
+    CGFloat rowH = 44;
+    CGFloat pad = 12;
+    CGFloat top = 14;
+    CGFloat h = top + 12 * rowH + 70;
+    if (h > window.bounds.size.height - 40) h = window.bounds.size.height - 40;
+
+    UIScrollView *panel = [[UIScrollView alloc] initWithFrame:
+        CGRectMake(window.bounds.size.width - w - 12, 60, w, h)];
+    panel.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.94];
+    panel.layer.cornerRadius = 14;
+    panel.layer.masksToBounds = YES;
+    panel.alwaysBounceVertical = YES;
+    panel.showsVerticalScrollIndicator = YES;
+    self.settingsPanel = panel;
+    [window addSubview:panel];
+    [window bringSubviewToFront:panel];
+
+    __block CGFloat y = top;
+
+    void (^addRow)(NSString *, UIView *) = ^(NSString *title, UIView *ctrl) {
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, 96, rowH)];
+        lab.text = title;
+        lab.textColor = [UIColor whiteColor];
+        lab.font = [UIFont systemFontOfSize:13];
+        lab.textAlignment = NSTextAlignmentLeft;
+        [panel addSubview:lab];
+        ctrl.frame = CGRectMake(pad + 100, y + 6, w - pad * 2 - 100, 30);
+        [panel addSubview:ctrl];
+        y += rowH;
+    };
+
+    // 点击间隔
+    UISlider *interval = [UISlider new];
+    interval.minimumValue = 0.05; interval.maximumValue = 2.0;
+    interval.value = self.clickInterval; interval.tag = WJTagIntervalSlider;
+    [interval addTarget:self action:@selector(intervalSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"点击间隔", interval);
+
+    // 点数量
+    UISlider *dotCountS = [UISlider new];
+    dotCountS.minimumValue = 1; dotCountS.maximumValue = 10;
+    dotCountS.value = self.dotCount; dotCountS.tag = WJTagDotCountSlider;
+    [dotCountS addTarget:self action:@selector(dotCountSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"点数量", dotCountS);
+
+    // 点大小
+    UISlider *dotSizeS = [UISlider new];
+    dotSizeS.minimumValue = 12; dotSizeS.maximumValue = 60;
+    dotSizeS.value = self.dotSize; dotSizeS.tag = WJTagDotSizeSlider;
+    [dotSizeS addTarget:self action:@selector(dotSizeSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"点大小", dotSizeS);
+
+    // 按钮大小
+    UISlider *btnSizeS = [UISlider new];
+    btnSizeS.minimumValue = 40; btnSizeS.maximumValue = 120;
+    btnSizeS.value = self.buttonSize; btnSizeS.tag = WJTagButtonSizeSlider;
+    [btnSizeS addTarget:self action:@selector(buttonSizeSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"攻击按钮", btnSizeS);
+
+    // 点透明度
+    UISlider *alphaS = [UISlider new];
+    alphaS.minimumValue = 0.2; alphaS.maximumValue = 1.0;
+    alphaS.value = self.dotAlpha; alphaS.tag = WJTagDotAlphaSlider;
+    [alphaS addTarget:self action:@selector(alphaSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"点透明度", alphaS);
+
+    // 攻击按钮透明度
+    UISlider *attackAlphaS = [UISlider new];
+    attackAlphaS.minimumValue = 0.2; attackAlphaS.maximumValue = 1.0;
+    attackAlphaS.value = self.attackButtonAlpha; attackAlphaS.tag = WJTagAttackAlphaSlider;
+    [attackAlphaS addTarget:self action:@selector(attackButtonAlphaSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"攻击钮透明度", attackAlphaS);
+
+    // 设置按钮透明度
+    UISlider *settingsAlphaS = [UISlider new];
+    settingsAlphaS.minimumValue = 0.2; settingsAlphaS.maximumValue = 1.0;
+    settingsAlphaS.value = self.settingsButtonAlpha; settingsAlphaS.tag = WJTagSettingsAlphaSlider;
+    [settingsAlphaS addTarget:self action:@selector(settingsButtonAlphaSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"设置钮透明度", settingsAlphaS);
+
+    // 攻击模式
+    UISegmentedControl *mode = [[UISegmentedControl alloc] initWithItems:@[@"按住", @"切换", @"隐藏"]];
+    mode.selectedSegmentIndex = self.attackMode; mode.tag = WJTagAttackModeSeg;
+    [mode addTarget:self action:@selector(attackModeChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"攻击模式", mode);
+
+    // 隐藏按钮
+    UISwitch *hide = [UISwitch new];
+    hide.on = self.shouldHideButtons; hide.tag = WJTagHideSwitch;
+    [hide addTarget:self action:@selector(hideSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"隐藏按钮", hide);
+
+    // 快捷开关（预留：原版附带，仅持久化）
+    UISwitch *qm = [UISwitch new];
+    qm.on = self.enableQuickMount; qm.tag = WJTagQuickMountSwitch;
+    [qm addTarget:self action:@selector(quickMountSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"快捷上马", qm);
+
+    UISwitch *qr = [UISwitch new];
+    qr.on = self.enableQuickReviveMount; qr.tag = WJTagQuickReviveSwitch;
+    [qr addTarget:self action:@selector(quickReviveMountSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"快捷复活", qr);
+
+    UISwitch *qc = [UISwitch new];
+    qc.on = self.enableQuickReturnCityMount; qc.tag = WJTagQuickReturnSwitch;
+    [qc addTarget:self action:@selector(quickReturnCityMountSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"快捷回城", qc);
+
+    // 保存 + 关闭
+    UIButton *save = [UIButton buttonWithType:UIButtonTypeRoundedRect];
+    [save setTitle:@"保存" forState:UIControlStateNormal];
+    [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    save.backgroundColor = [UIColor colorWithRed:0.1 green:0.5 blue:0.9 alpha:1.0];
+    save.layer.cornerRadius = 6;
+    save.tag = WJTagSaveButton;
+    [save addTarget:self action:@selector(saveButtonTapped) forControlEvents:UIControlEventTouchUpInside];
+    save.frame = CGRectMake(pad, y + 4, w / 2 - pad - 4, 36);
+
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeRoundedRect];
+    [close setTitle:@"关闭" forState:UIControlStateNormal];
+    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    close.backgroundColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    close.layer.cornerRadius = 6;
+    close.tag = WJTagCloseButton;
+    [close addTarget:self action:@selector(closeSettingsPanel) forControlEvents:UIControlEventTouchUpInside];
+    close.frame = CGRectMake(w / 2 + 4, y + 4, w / 2 - pad - 4, 36);
+
+    [panel addSubview:save];
+    [panel addSubview:close];
+    y += 48;
+
+    panel.contentSize = CGSizeMake(w, y + 8);
+}
+
+- (void)closeSettingsPanel {
+    [self.settingsPanel removeFromSuperview];
+    self.settingsPanel = nil;
+}
+
+#pragma mark - 设置面板控件回调
+
+- (void)intervalSliderChanged:(UISlider *)s {
+    self.clickInterval = s.value;
+}
+- (void)dotCountSliderChanged:(UISlider *)s {
+    NSInteger v = (NSInteger)lround(s.value);
+    if (v < 1) v = 1;
+    if (v != self.dotCount) {
+        self.dotCount = v;
+        [self recreateDotButtons];
+        [self updateButtonsVisibility];
+    }
+}
+- (void)dotSizeSliderChanged:(UISlider *)s {
+    self.dotSize = s.value;
+    [self recreateDotButtons];
+    [self updateButtonsVisibility];
+}
+- (void)buttonSizeSliderChanged:(UISlider *)s {
+    self.buttonSize = s.value;
+    [self updateAttackButtonSize];
+}
+- (void)alphaSliderChanged:(UISlider *)s {
+    self.dotAlpha = s.value;
+    for (UIButton *d in self.dotButtons) {
+        d.alpha = s.value;
+        d.titleLabel.alpha = s.value;
+    }
+}
+- (void)attackButtonAlphaSliderChanged:(UISlider *)s {
+    self.attackButtonAlpha = s.value;
+    self.attackButton.alpha = s.value;
+}
+- (void)settingsButtonAlphaSliderChanged:(UISlider *)s {
+    self.settingsButtonAlpha = s.value;
+    self.settingsButton.alpha = s.value;
+}
+- (void)attackModeChanged:(UISegmentedControl *)c {
+    self.attackMode = c.selectedSegmentIndex;
+    [self setupAttackButtonEvents];
+    [self updateButtonsVisibility];
+    if (self.isAttacking) [self stopClicking];
+}
+- (void)hideSwitchChanged:(UISwitch *)sw {
+    self.shouldHideButtons = sw.on;
+    [self updateButtonsVisibility];
+}
+- (void)quickMountSwitchChanged:(UISwitch *)sw { self.enableQuickMount = sw.on; }
+- (void)quickReviveMountSwitchChanged:(UISwitch *)sw { self.enableQuickReviveMount = sw.on; }
+- (void)quickReturnCityMountSwitchChanged:(UISwitch *)sw { self.enableQuickReturnCityMount = sw.on; }
+
+- (void)updateAttackButtonSize {
+    self.attackButton.frame = CGRectMake(0, 0, self.buttonSize, self.buttonSize);
+    self.attackButton.layer.cornerRadius = self.buttonSize / 2.0;
+}
+
+- (void)saveButtonTapped {
+    [self saveSettings];
+    [self savePositionsToFile];
+    WJLOG(@"settings saved");
+    [self closeSettingsPanel];
+}
+
+#pragma mark - 持久化
+
+- (void)loadSettings {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    self.clickInterval = [ud floatForKey:@"WJHookClickInterval"];
+    if (self.clickInterval == 0) self.clickInterval = 0.1;
+    self.dotCount = [ud integerForKey:@"WJHookDotCount"];
+    if (self.dotCount == 0) self.dotCount = 6;
+    self.shouldHideButtons = [ud boolForKey:@"WJHookShouldHideButtons"];
+    self.buttonSize = [ud floatForKey:@"WJHookButtonSize"];
+    if (self.buttonSize == 0) self.buttonSize = 80;
+    self.attackMode = [ud integerForKey:@"WJHookAttackMode"];
+    self.dotAlpha = [ud floatForKey:@"WJHookDotAlpha"];
+    if (self.dotAlpha == 0) self.dotAlpha = 0.7;
+    self.dotSize = [ud floatForKey:@"WJHookDotSize"];
+    if (self.dotSize == 0) self.dotSize = 30;
+    self.settingsButtonAlpha = [ud floatForKey:@"WJHookSettingsButtonAlpha"];
+    if (self.settingsButtonAlpha == 0) self.settingsButtonAlpha = 1.0;
+    self.attackButtonAlpha = [ud floatForKey:@"WJHookAttackButtonAlpha"];
+    if (self.attackButtonAlpha == 0) self.attackButtonAlpha = 1.0;
+    self.enableQuickReviveMount = [ud boolForKey:@"WJHookEnableQuickReviveMount"];
+    self.enableQuickReturnCityMount = [ud boolForKey:@"WJHookEnableQuickReturnCityMount"];
+    self.enableQuickMount = [ud boolForKey:@"WJHookEnableQuickMount"];
+    WJLOG(@"settings loaded: interval=%.2f dots=%ld mode=%ld", self.clickInterval,
+          (long)self.dotCount, (long)self.attackMode);
+}
+
+- (void)saveSettings {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setFloat:(float)self.clickInterval forKey:@"WJHookClickInterval"];
+    [ud setInteger:self.dotCount forKey:@"WJHookDotCount"];
+    [ud setBool:self.shouldHideButtons forKey:@"WJHookShouldHideButtons"];
+    [ud setFloat:(float)self.buttonSize forKey:@"WJHookButtonSize"];
+    [ud setInteger:self.attackMode forKey:@"WJHookAttackMode"];
+    [ud setFloat:(float)self.dotAlpha forKey:@"WJHookDotAlpha"];
+    [ud setFloat:(float)self.dotSize forKey:@"WJHookDotSize"];
+    [ud setFloat:(float)self.settingsButtonAlpha forKey:@"WJHookSettingsButtonAlpha"];
+    [ud setFloat:(float)self.attackButtonAlpha forKey:@"WJHookAttackButtonAlpha"];
+    [ud setBool:self.enableQuickReviveMount forKey:@"WJHookEnableQuickReviveMount"];
+    [ud setBool:self.enableQuickReturnCityMount forKey:@"WJHookEnableQuickReturnCityMount"];
+    [ud setBool:self.enableQuickMount forKey:@"WJHookEnableQuickMount"];
+    [ud synchronize];
+}
+
+- (NSString *)positionsPath {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [[paths firstObject] stringByAppendingPathComponent:@"WJTapPositions.plist"];
+}
+
+- (void)savePositionsToFile {
+    @try {
+        NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+        dict[@"attack"] = NSStringFromCGPoint(self.attackButton.center);
+        dict[@"settings"] = NSStringFromCGPoint(self.settingsButton.center);
+        NSMutableArray *dots = [NSMutableArray array];
+        for (UIButton *d in self.dotButtons) {
+            [dots addObject:NSStringFromCGPoint(d.center)];
+        }
+        dict[@"dots"] = dots;
+        BOOL ok = [dict writeToFile:[self positionsPath] atomically:YES];
+        WJLOG(@"positions saved: %d (%ld dots)", ok, (long)dots.count);
+    } @catch (NSException *e) {
+        WJLOG(@"savePositions ex: %@", e);
+    }
+}
+
+- (void)loadPositionsFromFile {
+    @try {
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:[self positionsPath]];
+        if (!dict) return;
+        NSString *attack = dict[@"attack"];
+        NSString *settings = dict[@"settings"];
+        NSArray *dots = dict[@"dots"];
+        if (attack) self.attackButton.center = CGPointFromString(attack);
+        if (settings) self.settingsButton.center = CGPointFromString(settings);
+        if (dots.count && dots.count == self.dotButtons.count) {
+            for (NSInteger i = 0; i < self.dotButtons.count; i++) {
+                self.dotButtons[i].center = CGPointFromString(dots[i]);
+            }
+        }
+        WJLOG(@"positions loaded: dots=%ld", (long)dots.count);
+    } @catch (NSException *e) {
+        WJLOG(@"loadPositions ex: %@", e);
+    }
+}
+
+@end

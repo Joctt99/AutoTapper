@@ -1,21 +1,18 @@
 # ===========================================================================
-#  AutoTapper — Theos 构建脚本
-#  目标: iPhone 13 Pro / iOS 17.0 (arm64 + arm64e, rootless)
+#  AutoTapper — Theos 构建脚本（WJHook 机制重写版）
 # ===========================================================================
 #
-#  说明:
-#   - THEOS_PACKAGE_SCHEME=rootless 让 Theos 把产物装到 /var/jb/
-#     (dopamine / palera1n rootless / ellekit 都是这个布局)
-#   - TARGET 最低 13.0：代码里用到 UIWindowScene(13.0+)，
-#     低版本走 initWithFrame: 分支，所以不需要 #if 包。
-#   - 私有符号(IOHIDEvent / GSSendEvent / AVSystemController)全部用
-#     dlsym 运行时解析，不静态链接，避免私有 framework 链接失败。
+#  机制说明:
+#   - 产物为纯 ObjC 注入库（%config(generator=internal) + 零 _LIBRARIES），
+#     不依赖 CydiaSubstrate/越狱框架，证书签名侧载普通 App 可用。
+#   - 屏幕几何完全不碰 UIScreen（iOS 26 注入进程内 UIScreen.mainScreen
+#     会信号级 BAD_ACCESS，@try 捕不住）——一律取自 keyWindow。
+#   - 触摸模拟为进程内事件派发（UITouch KVC + touchesBegan/Ended +
+#     UITouchesEvent 私有类），无 HID/越狱依赖。
+#   - 只编 arm64：arm64e 切片老系统 dyld 层崩，侧载不需要。
 # ===========================================================================
 
 export TARGET       = iphone:clang:latest:13.0
-# 只编 arm64：arm64e 切片需要 iOS >= 14，且新工具链的 arm64e 有 PAC 密钥
-# 兼容问题（老系统上加载即崩）。arm64e 设备（A12+）完全兼容运行纯 arm64
-# 二进制，功能无差别。侧载场景不需要 arm64e。
 export ARCHS        = arm64
 export THEOS_PACKAGE_SCHEME = rootless
 export DEBUG        = 0
@@ -26,18 +23,9 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = AutoTapper
 
-# Logos 入口 / 音量键 Logos hook / 各功能模块
 AutoTapper_FILES = \
 	AutoTapper.xm \
-	Tweak.xm \
-	YGCore.m \
-	YGConfig.m \
-	YGHID.m \
-	YGTouchInjector.m \
-	YGTapEngine.m \
-	YGVolumeButton.m \
-	YGOverlayWindow.m \
-	YGOverlayController.m
+	WJTapCore.m
 
 AutoTapper_CFLAGS = \
 	-fobjc-arc \
@@ -45,18 +33,13 @@ AutoTapper_CFLAGS = \
 	-Wno-unused-parameter \
 	-Wno-deprecated-declarations \
 	-Wno-objc-multiple-method-names \
-	-Wno-arc-performSelector-leaks \
-	-DYG_TWEAK=1
+	-Wno-arc-performSelector-leaks
 
 AutoTapper_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics
 
-# 侧载（证书签名）场景：清空 substrate 链接，产物不依赖 CydiaSubstrate，
-# 否则注入普通 App 后 dyld 找不到 @rpath/CydiaSubstrate.framework 直接闪退。
-# 配合两个 .xm 顶部的 %config(generator=internal)，hook 走 objc runtime。
+# 侧载场景：清空 substrate 链接，产物不依赖 CydiaSubstrate
 AutoTapper_LIBRARIES =
 
-# GSEvent 旧后端默认关闭（iOS 15+ 的 purple port 已不再接受进程外事件）；
-# 需要在 iOS 13/14 上试旧路时可打开： make ... ADDITIONAL_CFLAGS=-DYG_ENABLE_GSEVENT=1
 AutoTapper_LDFLAGS = -undefined dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/tweak.mk
