@@ -116,7 +116,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 @property (nonatomic, assign) NSInteger dotCount;          // 默认 6
 @property (nonatomic, assign) BOOL shouldHideButtons;      // 默认 NO
 @property (nonatomic, assign) CGFloat buttonSize;          // 默认 80
-@property (nonatomic, assign) NSInteger attackMode;        // 0=按住 1=切换 2=隐藏
+@property (nonatomic, assign) NSInteger attackMode;        // 0=开关 1=滑动 2=隐藏
 @property (nonatomic, assign) CGFloat dotAlpha;            // 默认 0.7
 @property (nonatomic, assign) CGFloat dotSize;             // 默认 30
 @property (nonatomic, assign) CGFloat settingsButtonAlpha; // 默认 1.0
@@ -138,6 +138,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     BOOL _uiReady;
     BOOL _retryScheduled;
     NSInteger _retryCount;
+    UILabel *_intervalValueLabel;
 }
 
 + (instancetype)shared {
@@ -307,15 +308,17 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     if (self.attackMode == 2) {
         self.attackButton.hidden = YES;   // 隐藏模式：不显示攻击按钮
     } else if (self.attackMode == 1) {
-        [self.attackButton addTarget:self action:@selector(toggleAttackMode)
-                    forControlEvents:UIControlEventTouchUpInside];
-        [self updateAttackButtonAppearance];
-    } else {
+        // 滑动模式：按住即开始连点，松手停止（拖动改位置不受影响）
         [self.attackButton addTarget:self action:@selector(attackButtonTouchDown)
                     forControlEvents:UIControlEventTouchDown];
         [self.attackButton addTarget:self action:@selector(attackButtonTouchUp)
                     forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside |
                                         UIControlEventTouchCancel];
+    } else {
+        // 开关模式（默认）：点一下开始连点，再点一下停止
+        [self.attackButton addTarget:self action:@selector(toggleAttackMode)
+                    forControlEvents:UIControlEventTouchUpInside];
+        [self updateAttackButtonAppearance];
     }
 }
 
@@ -441,8 +444,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
 - (void)handleDotTap:(UIButton *)dot {
     NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{
-        // 后台线程：随机 0~40ms 微延迟（模拟人手节奏，避免瞬时全点）
-        usleep(arc4random_uniform(5) * 10000);
+        // 后台线程：随机 0~5ms 微延迟（毫秒级响应，保留一点人手节奏）
+        usleep(arc4random_uniform(2) * 5000);
         CGPoint p = [self dotCenterOnMain:dot];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self addScaleAnimationToButton:dot];
@@ -461,7 +464,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     if (self.attackMode == 2 && dot.tag != 1 && self.dotButtons.count > 0) {
         UIButton *first = self.dotButtons.firstObject;
         NSBlockOperation *op2 = [NSBlockOperation blockOperationWithBlock:^{
-            usleep(arc4random_uniform(5) * 10000);
+            usleep(arc4random_uniform(2) * 5000);
             CGPoint p = [self dotCenterOnMain:first];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self simulateTapAtPoint:p];
@@ -500,19 +503,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
         [g setTranslation:CGPointZero inView:btn.superview];
     } else if (g.state == UIGestureRecognizerStateEnded) {
         [self savePositionsToFile];
-        // 攻击按钮动了，圆点围绕它重新排布
-        [self layoutDotButtonsInCircle];
-    }
-}
-
-- (void)layoutDotButtonsInCircle {
-    CGPoint ac = self.attackButton.center;
-    CGFloat radius = 100.0;
-    NSInteger count = (NSInteger)self.dotButtons.count;
-    for (NSInteger i = 0; i < count; i++) {
-        CGFloat ang = (2.0 * M_PI / (CGFloat)count) * (CGFloat)i;
-        self.dotButtons[i].center = CGPointMake(ac.x + cos(ang) * radius,
-                                                ac.y + sin(ang) * radius);
+        // 攻击按钮与连点点解耦：拖动只移动按钮本身，点位置保持不动
     }
 }
 
@@ -572,7 +563,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 - (void)scheduleClicks {
     for (UIButton *dot in self.dotButtons) {
         NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{
-            usleep(arc4random_uniform(5) * 10000);
+            usleep(arc4random_uniform(2) * 5000);   // 毫秒级：0~5ms 随机微延迟
             CGPoint p = [self dotCenterOnMain:dot];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self simulateTapAtPoint:p];
@@ -709,7 +700,9 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     CGFloat pad = 12;
     CGFloat top = 14;
     CGFloat h = top + 17 * rowH + 70;
-    if (h > window.bounds.size.height - 40) h = window.bounds.size.height - 40;
+    // 面板过高时压缩可视高度，内容仍完整可滚动（UIScrollView）
+    CGFloat maxH = window.bounds.size.height * 0.62;
+    if (h > maxH) h = maxH;
 
     UIScrollView *panel = [[UIScrollView alloc] initWithFrame:
         CGRectMake(window.bounds.size.width - w - 12, 60, w, h)];
@@ -736,12 +729,27 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
         y += rowH;
     };
 
-    // 点击间隔
+    // 点击间隔（毫秒级：5ms~2000ms，右侧实时显示数值）
+    UILabel *intervalLab = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, 96, rowH)];
+    intervalLab.text = @"点击间隔";
+    intervalLab.textColor = [UIColor whiteColor];
+    intervalLab.font = [UIFont systemFontOfSize:13];
+    intervalLab.textAlignment = NSTextAlignmentLeft;
+    [panel addSubview:intervalLab];
     UISlider *interval = [UISlider new];
-    interval.minimumValue = 0.05; interval.maximumValue = 2.0;
+    interval.minimumValue = 0.005; interval.maximumValue = 2.0;
     interval.value = self.clickInterval; interval.tag = WJTagIntervalSlider;
     [interval addTarget:self action:@selector(intervalSliderChanged:) forControlEvents:UIControlEventValueChanged];
-    addRow(@"点击间隔", interval);
+    interval.frame = CGRectMake(pad + 100, y + 6, w - pad * 2 - 100 - 64, 30);
+    [panel addSubview:interval];
+    UILabel *intervalVal = [[UILabel alloc] initWithFrame:CGRectMake(w - pad - 60, y + 6, 60, 30)];
+    intervalVal.text = [NSString stringWithFormat:@"%.0f ms", self.clickInterval * 1000.0];
+    intervalVal.textColor = [UIColor colorWithRed:0.45 green:0.85 blue:1.0 alpha:1.0];
+    intervalVal.font = [UIFont boldSystemFontOfSize:13];
+    intervalVal.textAlignment = NSTextAlignmentRight;
+    [panel addSubview:intervalVal];
+    _intervalValueLabel = intervalVal;
+    y += rowH;
 
     // 点数量
     UISlider *dotCountS = [UISlider new];
@@ -786,7 +794,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     addRow(@"设置钮透明度", settingsAlphaS);
 
     // 攻击模式
-    UISegmentedControl *mode = [[UISegmentedControl alloc] initWithItems:@[@"按住", @"切换", @"隐藏"]];
+    UISegmentedControl *mode = [[UISegmentedControl alloc] initWithItems:@[@"开关", @"滑动", @"隐藏"]];
     mode.selectedSegmentIndex = self.attackMode; mode.tag = WJTagAttackModeSeg;
     [mode addTarget:self action:@selector(attackModeChanged:) forControlEvents:UIControlEventValueChanged];
     addRow(@"攻击模式", mode);
@@ -797,12 +805,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     [hide addTarget:self action:@selector(hideSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     addRow(@"隐藏按钮", hide);
 
-    // 快捷开关（预留：原版附带，仅持久化）
-    UISwitch *qm = [UISwitch new];
-    qm.on = self.enableQuickMount; qm.tag = WJTagQuickMountSwitch;
-    [qm addTarget:self action:@selector(quickMountSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-    addRow(@"快捷上马", qm);
-
+    // 快捷复活 / 快捷回城（原版附带，仅持久化）
     UISwitch *qr = [UISwitch new];
     qr.on = self.enableQuickReviveMount; qr.tag = WJTagQuickReviveSwitch;
     [qr addTarget:self action:@selector(quickReviveMountSwitchChanged:) forControlEvents:UIControlEventValueChanged];
@@ -881,6 +884,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
 - (void)intervalSliderChanged:(UISlider *)s {
     self.clickInterval = s.value;
+    _intervalValueLabel.text = [NSString stringWithFormat:@"%.0f ms", s.value * 1000.0];
+    if (self.isAttacking) [self startClicking];   // 连点中：重启 timer，新间隔立即生效
 }
 - (void)dotCountSliderChanged:(UISlider *)s {
     NSInteger v = (NSInteger)lround(s.value);
