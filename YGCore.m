@@ -156,16 +156,10 @@ static UIWindowScene *YGActiveWindowScene(void) {
 }
 
 CGRect YGScreenBounds(void) {
-    // 防御式取值：任何一步失败立即回退，屏幕几何绝不当崩溃点。
+    // 防御式取值，且启动路径完全绕开 connectedScenes / UIWindowScene：
+    // iOS 26 上启动早期枚举场景是崩溃高发点（BAD_ACCESS，@try 兜不住）。
+    // 场景相关的精细取值只在 install 阶段做（那时场景已稳定）。
     @try {
-        // UIScreen.bounds 在 iOS 8+ 就是「当前界面方向」下的逻辑 point bounds，
-        // 比 deprecated 的 [UIScreen mainScreen].applicationFrame 更适合注入场景。
-        UIWindowScene *ws = YGActiveWindowScene();
-        if (ws) {
-            UIWindow *w = YGForegroundWindow();
-            if (w && w.bounds.size.width > 0 && w.bounds.size.height > 0) return w.bounds;
-            if (ws.coordinateSpace.bounds.size.width > 0) return ws.coordinateSpace.bounds;
-        }
         UIScreen *main = UIScreen.mainScreen;
         if (main) {
             CGRect b = main.bounds;

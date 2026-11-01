@@ -70,8 +70,13 @@ static void YGInstallOrientationHook(void);
     CGFloat ss = YGScreenScale();
     YGLOG(@"screen=%@ scale=%.1f", NSStringFromCGRect(sb), ss);
 
-    // 3) 悬浮 UI
-    [[YGOverlayController shared] install];
+    // 3) 悬浮 UI（整体防御：iOS 26 上窗口/场景 API 崩点集中在这里，
+    //    抛出的 NSException 一律捕获，绝不让 App 闪退）
+    @try {
+        [[YGOverlayController shared] install];
+    } @catch (NSException *e) {
+        YGLOG(@"overlay install threw: %@", e);
+    }
 
     // 3) 音量减键（仅 SpringBoard 有意义：App 进程里收不到系统级按键）
     if ([self isSpringBoard]) {

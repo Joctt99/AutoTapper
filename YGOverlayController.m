@@ -452,24 +452,33 @@ static UILabel *YGMakeLabel(NSString *text, CGFloat size, UIColor *color) {
 
     YGConfig *cfg = YGConfig.shared;
     CGSize size = YGScreenSize();
+    YGLOG(@"overlay install: size=%@", NSStringFromCGSize(size));
 
-    // ---- 窗口 ----
+    // ---- 窗口（场景查询防御化：iOS 26 上启动早期枚举场景可能崩）----
     UIWindowScene *scene = nil;
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *ws = (UIWindowScene *)s;
-            if (ws.activationState == UISceneActivationStateForegroundActive) { scene = ws; break; }
-        }
-    }
-    if (!scene) {
+    @try {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)s;
+                if (ws.activationState == UISceneActivationStateForegroundActive) { scene = ws; break; }
+            }
         }
+        if (!scene) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+            }
+        }
+    } @catch (NSException *e) {
+        YGLOG(@"overlay install: scene lookup exception: %@", e);
+        scene = nil;
     }
+    YGLOG(@"overlay install: scene=%@", scene);
 
     _window = [[YGOverlayWindow alloc] initWithWindowScene:scene];
+    YGLOG(@"overlay install: window=%@", _window);
     _window.frame = CGRectMake(0, 0, size.width, size.height);
     [_window yg_present];
+    YGLOG(@"overlay install: presented");
 
     UIView *root = [_window ygContentRoot];
 
