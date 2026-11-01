@@ -57,6 +57,8 @@ static void YGInstallOrientationHook(void);
 
     YGLOG(@"==== AutoTapper bootstrap: %@ (springboard=%d) ====",
           reason, [self isSpringBoard]);
+    // 版本标记：每次编译都会变，用来核对用户实际装的是哪一版
+    YGLOG(@"build: %s %s arch=%s", __DATE__, __TIME__, "arm64");
     YGLOG(@"device=%@ system=%@", [UIDevice currentDevice].model,
           [UIDevice currentDevice].systemVersion);
 
@@ -65,9 +67,17 @@ static void YGInstallOrientationHook(void);
     // 启动环境摘要：日志路径 + 后端可用矩阵，一眼定位问题
     [YGLog logEnvironment];
 
-    // 2) 屏幕几何（防御式函数，异常自动回退，不会崩）
-    CGRect sb = YGScreenBounds();
-    CGFloat ss = YGScreenScale();
+    // 2) 屏幕几何——逐步打桩：每一步都先打日志再执行，
+    //    若 BAD_ACCESS 崩溃，日志能精确停在出问题的那一行
+    YGLOG(@"boot: screen calc begin");
+    CGRect sb = CGRectZero;
+    CGFloat ss = 0;
+    @try { sb = YGScreenBounds(); }
+    @catch (NSException *e) { YGLOG(@"boot: bounds exception: %@", e); }
+    YGLOG(@"boot: bounds=%@", NSStringFromCGRect(sb));
+    @try { ss = YGScreenScale(); }
+    @catch (NSException *e) { YGLOG(@"boot: scale exception: %@", e); }
+    YGLOG(@"boot: scale=%.1f", ss);
     YGLOG(@"screen=%@ scale=%.1f", NSStringFromCGRect(sb), ss);
 
     // 3) 悬浮 UI（整体防御：iOS 26 上窗口/场景 API 崩点集中在这里，
@@ -77,6 +87,7 @@ static void YGInstallOrientationHook(void);
     } @catch (NSException *e) {
         YGLOG(@"overlay install threw: %@", e);
     }
+    YGLOG(@"boot: install returned");
 
     // 3) 音量减键（仅 SpringBoard 有意义：App 进程里收不到系统级按键）
     if ([self isSpringBoard]) {
@@ -149,28 +160,35 @@ static void YGInstallOrientationHook(void);
         YGLOG(@"tweak loaded into %@", bid.length ? bid : @"?");
 
         // 非 SpringBoard 进程（plist 里额外加了 App 时才会走到）：
-        // 等 UIApplicationDidFinishLaunching 后再装，避开 App 启动早期
-        // UIKit 场景未就绪（iOS 26 上此时枚举 connectedScenes 会崩）。
-        // 3 秒兜底：万一通知已错过，强制启动。
+        // 启动时机多级触发——didFinishLaunching / didBecomeActive / 3 秒兜底，
+        // 谁先到用谁。iOS 26 上 didFinishLaunching 通知可能不派发（日志显示
+        // 之前全靠 3 秒兜底），didBecomeActive 是 App 界面出现的可靠信号。
+        // 每级都带来源标记，方便从日志判断走了哪条路。
         if (![bid isEqualToString:@"com.apple.springboard"]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 static dispatch_once_t once;
                 dispatch_once(&once, ^{
-                    __block id obs = nil;
-                    void (^start)(void) = ^{
-                        [[NSNotificationCenter defaultCenter] removeObserver:obs];
+                    __block id obsDL = nil;
+                    __block id obsBA = nil;
+                    void (^start)(NSString *src) = ^(NSString *src) {
+                        [[NSNotificationCenter defaultCenter] removeObserver:obsDL];
+                        [[NSNotificationCenter defaultCenter] removeObserver:obsBA];
                         NSString *bid2 = [NSBundle mainBundle].bundleIdentifier ?: @"?";
                         [[YGBootstrap shared] startWithReason:
-                            [NSString stringWithFormat:@"app %@ (didFinishLaunching)", bid2]];
+                            [NSString stringWithFormat:@"app %@ (%@)", bid2, src]];
                     };
-                    obs = [[NSNotificationCenter defaultCenter]
+                    obsDL = [[NSNotificationCenter defaultCenter]
                         addObserverForName:UIApplicationDidFinishLaunchingNotification
                                     object:nil queue:[NSOperationQueue mainQueue]
-                                usingBlock:^(NSNotification *n) { start(); }];
+                                usingBlock:^(NSNotification *n) { start(@"didFinishLaunching"); }];
+                    obsBA = [[NSNotificationCenter defaultCenter]
+                        addObserverForName:UIApplicationDidBecomeActiveNotification
+                                    object:nil queue:[NSOperationQueue mainQueue]
+                                usingBlock:^(NSNotification *n) { start(@"didBecomeActive"); }];
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                                  (int64_t)(3 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
-                        if (![YGBootstrap shared].started) start();
+                        if (![YGBootstrap shared].started) start(@"3s-fallback");
                     });
                 });
             });
