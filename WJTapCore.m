@@ -109,6 +109,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 @property (nonatomic, strong) UIScrollView *settingsPanel;
 @property (nonatomic, strong) UIPanGestureRecognizer *handlePanGesture;
 @property (nonatomic, strong) UIPanGestureRecognizer *settingsPanGesture;
+@property (nonatomic, strong) UILabel *titleLabel;   // 顶部悬浮标题
 @property (nonatomic, assign) BOOL isVerified;
 
 // 设置项
@@ -139,6 +140,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     BOOL _retryScheduled;
     NSInteger _retryCount;
     UILabel *_intervalValueLabel;
+    UILabel *_dotCountValueLabel;
+    BOOL _attackDragged;   // 攻钮刚被拖动（短窗口内抑制 toggle 误触发）
 }
 
 + (instancetype)shared {
@@ -223,6 +226,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
     self.isVerified = YES;   // 无验证机制：始终视为已验证
 
+    [self createTitleLabelInWindow:window];
+
     // --- 攻击按钮（红色圆形） ---
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, self.buttonSize, self.buttonSize);
@@ -289,6 +294,28 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     WJLOG(@"steer frame: %@ hidden=%d", NSStringFromCGRect(v.frame), v.hidden);
 }
 
+- (void)createTitleLabelInWindow:(UIWindow *)window {
+    UILabel *lab = [[UILabel alloc] init];
+    lab.text = @"老玩家连点";
+    lab.font = [UIFont boldSystemFontOfSize:18];
+    lab.textColor = [UIColor whiteColor];
+    lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+    lab.layer.cornerRadius = 12;
+    lab.layer.masksToBounds = YES;
+    lab.textAlignment = NSTextAlignmentCenter;
+    lab.userInteractionEnabled = NO;   // 完全透传触摸，不挡游戏操作
+    [lab sizeToFit];
+    CGRect f = lab.frame;
+    f.size.width += 28;
+    f.size.height = 32;
+    lab.frame = f;
+    lab.center = CGPointMake(window.bounds.size.width / 2.0, 64);
+    self.titleLabel = lab;
+    [window addSubview:lab];
+    [window bringSubviewToFront:lab];
+    WJLOG(@"title label: %@", NSStringFromCGRect(lab.frame));
+}
+
 - (void)updateSteerFrame {
     self.steerFrameView.frame = self.steerRect;
     self.steerFrameView.hidden = !self.steerProtectEnabled;
@@ -299,6 +326,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                           action:@selector(handleDragHandlePan:)];
     pan.maximumNumberOfTouches = 1;
+    // 关键：pan 识别后不吞掉 touches，保证轻点仍触发 TouchUpInside（开关模式不失效）
+    pan.cancelsTouchesInView = NO;
     [self.attackButton addGestureRecognizer:pan];
     self.handlePanGesture = pan;
 }
@@ -308,12 +337,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     if (self.attackMode == 2) {
         self.attackButton.hidden = YES;   // 隐藏模式：不显示攻击按钮
     } else if (self.attackMode == 1) {
-        // 滑动模式：按住即开始连点，松手停止（拖动改位置不受影响）
-        [self.attackButton addTarget:self action:@selector(attackButtonTouchDown)
-                    forControlEvents:UIControlEventTouchDown];
-        [self.attackButton addTarget:self action:@selector(attackButtonTouchUp)
-                    forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside |
-                                        UIControlEventTouchCancel];
+        // 滑动模式：连点由攻钮拖动驱动（handleDragHandlePan：拖动开始→开始连点，松手→停止）
+        [self updateAttackButtonAppearance];
     } else {
         // 开关模式（默认）：点一下开始连点，再点一下停止
         [self.attackButton addTarget:self action:@selector(toggleAttackMode)
@@ -333,6 +358,12 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 }
 
 - (void)toggleAttackMode {
+    // 刚拖动过攻钮（0.4s 内）：这是拖动松手而非点按，不切换
+    if (_attackDragged) {
+        _attackDragged = NO;
+        return;
+    }
+    WJLOG(@"attack toggle: %@", self.isAttacking ? @"stop" : @"start");
     if (self.isAttacking) {
         [self stopClicking];
     } else {
@@ -498,11 +529,30 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 - (void)handleDragHandlePan:(UIPanGestureRecognizer *)g {
     UIView *btn = g.view;
     CGPoint t = [g translationInView:btn.superview];
-    if (g.state == UIGestureRecognizerStateChanged) {
+    if (g.state == UIGestureRecognizerStateBegan) {
+        // 滑动模式：开始拖动即开始连点（按住不动不算滑动）
+        if (self.attackMode == 1 && !self.isAttacking) {
+            [self startClicking];
+            [self startDotAnimation];
+            [self updateAttackButtonAppearance];
+        }
+    } else if (g.state == UIGestureRecognizerStateChanged) {
         btn.center = CGPointMake(btn.center.x + t.x, btn.center.y + t.y);
         [g setTranslation:CGPointZero inView:btn.superview];
-    } else if (g.state == UIGestureRecognizerStateEnded) {
+    } else if (g.state == UIGestureRecognizerStateEnded ||
+               g.state == UIGestureRecognizerStateCancelled) {
+        if (self.attackMode == 1 && self.isAttacking) {
+            [self stopClicking];
+            [self stopDotAnimation];
+            [self updateAttackButtonAppearance];
+        }
         [self savePositionsToFile];
+        // 刚拖动过：短窗口内抑制开关模式的 toggle 误触发
+        _attackDragged = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            self->_attackDragged = NO;
+        });
         // 攻击按钮与连点点解耦：拖动只移动按钮本身，点位置保持不动
     }
 }
@@ -737,7 +787,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     intervalLab.textAlignment = NSTextAlignmentLeft;
     [panel addSubview:intervalLab];
     UISlider *interval = [UISlider new];
-    interval.minimumValue = 0.005; interval.maximumValue = 2.0;
+    interval.minimumValue = 0.01; interval.maximumValue = 0.5;   // 10~500ms（对齐反编译原版）
     interval.value = self.clickInterval; interval.tag = WJTagIntervalSlider;
     [interval addTarget:self action:@selector(intervalSliderChanged:) forControlEvents:UIControlEventValueChanged];
     interval.frame = CGRectMake(pad + 100, y + 6, w - pad * 2 - 100 - 64, 30);
@@ -751,12 +801,27 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     _intervalValueLabel = intervalVal;
     y += rowH;
 
-    // 点数量
+    // 点数量（右侧实时标注当前连点位个数）
+    UILabel *dotCountLab = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, 96, rowH)];
+    dotCountLab.text = @"点数量";
+    dotCountLab.textColor = [UIColor whiteColor];
+    dotCountLab.font = [UIFont systemFontOfSize:13];
+    dotCountLab.textAlignment = NSTextAlignmentLeft;
+    [panel addSubview:dotCountLab];
     UISlider *dotCountS = [UISlider new];
     dotCountS.minimumValue = 1; dotCountS.maximumValue = 10;
     dotCountS.value = self.dotCount; dotCountS.tag = WJTagDotCountSlider;
     [dotCountS addTarget:self action:@selector(dotCountSliderChanged:) forControlEvents:UIControlEventValueChanged];
-    addRow(@"点数量", dotCountS);
+    dotCountS.frame = CGRectMake(pad + 100, y + 6, w - pad * 2 - 100 - 64, 30);
+    [panel addSubview:dotCountS];
+    UILabel *dotCountVal = [[UILabel alloc] initWithFrame:CGRectMake(w - pad - 60, y + 6, 60, 30)];
+    dotCountVal.text = [NSString stringWithFormat:@"%ld 个", (long)self.dotCount];
+    dotCountVal.textColor = [UIColor colorWithRed:0.45 green:0.85 blue:1.0 alpha:1.0];
+    dotCountVal.font = [UIFont boldSystemFontOfSize:13];
+    dotCountVal.textAlignment = NSTextAlignmentRight;
+    [panel addSubview:dotCountVal];
+    _dotCountValueLabel = dotCountVal;
+    y += rowH;
 
     // 点大小
     UISlider *dotSizeS = [UISlider new];
@@ -890,6 +955,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 - (void)dotCountSliderChanged:(UISlider *)s {
     NSInteger v = (NSInteger)lround(s.value);
     if (v < 1) v = 1;
+    _dotCountValueLabel.text = [NSString stringWithFormat:@"%ld 个", (long)v];
     if (v != self.dotCount) {
         self.dotCount = v;
         [self recreateDotButtons];
