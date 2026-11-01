@@ -302,8 +302,9 @@ static inline BOOL YGPointInsideTapZone(CGPoint pointInWindow) {
     if (scene) {
         self = [super initWithWindowScene:scene];
     } else {
-        // iOS 12 及以下 / scene 尚未就绪时的兜底
-        self = [super initWithFrame:UIScreen.mainScreen.bounds];
+        // ★ iOS 12 及以下 / scene 尚未就绪时的兜底。
+        // 不碰 UIScreen.mainScreen（iOS 26 注入场景实测会信号级崩溃），用固定值。
+        self = [super initWithFrame:CGRectMake(0, 0, 390, 844)];
     }
     if (self) {
         // 高于 UIWindowLevelAlert(2000)：盖住音量 HUD、来电横幅、系统 toast

@@ -142,9 +142,9 @@ static UIWindowScene *YGActiveWindowScene(void) {
             else if (ws.activationState == UISceneActivationStateForegroundInactive) score += 50;
             else if (ws.activationState == UISceneActivationStateBackground) score += 1;
 
-            // 主屏优先（external display / CarPlay 也会是 UIWindowScene）
-            UIScreen *main = UIScreen.mainScreen;
-            if (main && [ws.screen isEqual:main]) score += 20;
+            // ★ iOS 26 注入场景：不访问 UIScreen（实测 +mainScreen 会信号级崩溃），
+            //   有 screen 的场景一律视为「主屏候选」加分
+            if (ws.screen != nil) score += 20;
 
             if (score > bestScore) { bestScore = score; best = ws; }
         }
@@ -156,31 +156,49 @@ static UIWindowScene *YGActiveWindowScene(void) {
 }
 
 CGRect YGScreenBounds(void) {
-    // 防御式取值，且启动路径完全绕开 connectedScenes / UIWindowScene：
-    // iOS 26 上启动早期枚举场景是崩溃高发点（BAD_ACCESS，@try 兜不住）。
-    // 场景相关的精细取值只在 install 阶段做（那时场景已稳定）。
+    // ★ iOS 26 注入 App 进程的实测结论：UIScreen.mainScreen 会触发
+    //   信号级崩溃（BAD_ACCESS，@try 捕不住）。因此**完全不碰 UIScreen**，
+    //   优先从现有 UIWindow 读取屏幕逻辑尺寸，拿不到就用 iPhone 常用尺寸兜底。
+    //   函数内带探针日志：万一仍崩，能确认崩在具体哪一行。
+    YGLOG(@"sb: begin");
     @try {
-        UIScreen *main = UIScreen.mainScreen;
-        if (main) {
-            CGRect b = main.bounds;
-            if (b.size.width > 0 && b.size.height > 0) return b;
+        UIApplication *app = UIApplication.sharedApplication;
+        YGLOG(@"sb: app=%@", app);
+        if (app) {
+            NSArray<UIWindow *> *wins = app.windows;
+            YGLOG(@"sb: windows=%lu", (unsigned long)wins.count);
+            for (UIWindow *w in wins) {
+                if (w && !w.hidden && w.bounds.size.width > 0 && w.bounds.size.height > 0) {
+                    YGLOG(@"sb: from window %@", NSStringFromCGRect(w.bounds));
+                    return w.bounds;
+                }
+            }
         }
     } @catch (NSException *e) {
-        NSLog(@"[AutoTapper] YGScreenBounds exception: %@", e);
+        YGLOG(@"sb: exception: %@", e);
     }
-    // 极端情况下（注入过早，UIScreen 还没就绪）用 iPhone 13 Pro 的物理尺寸兜底
+    YGLOG(@"sb: fallback 390x844");
+    // 极端情况下（无窗口可用）用 iPhone 常用逻辑尺寸兜底
     return CGRectMake(0, 0, 390, 844);
 }
 
 CGSize  YGScreenSize(void)  { return YGScreenBounds().size; }
 CGFloat YGScreenScale(void) {
+    // 同样不碰 UIScreen.mainScreen.scale（iOS 26 注入场景会崩）。
+    // 从现有窗口的 traitCollection 取 scale，否则用 3.0 兜底。
     @try {
-        CGFloat s = UIScreen.mainScreen.scale;
-        return s > 0 ? s : 3.0;
+        UIApplication *app = UIApplication.sharedApplication;
+        if (app) {
+            for (UIWindow *w in app.windows) {
+                if (w && !w.hidden && w.traitCollection.displayScale > 0) {
+                    return w.traitCollection.displayScale;
+                }
+            }
+        }
     } @catch (NSException *e) {
         NSLog(@"[AutoTapper] YGScreenScale exception: %@", e);
-        return 3.0;
     }
+    return 3.0;
 }
 
 BOOL YGIsOverlayWindow(UIWindow *w) {
