@@ -17,6 +17,10 @@
 #import <objc/runtime.h>
 #import <string.h>
 
+// 侧载（证书签名）场景没有 CydiaSubstrate，用 Logos internal 生成器：
+// 生成的 hook 直接走 Objective-C runtime，产物不依赖任何注入框架。
+%config(generator=internal)
+
 #pragma mark - 前向声明
 
 // 定义在文件末尾（%hook 之后），这里先声明，避免 C 的「先声明后使用」报错

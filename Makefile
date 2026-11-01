@@ -47,6 +47,11 @@ AutoTapper_CFLAGS = \
 
 AutoTapper_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics
 
+# 侧载（证书签名）场景：清空 substrate 链接，产物不依赖 CydiaSubstrate，
+# 否则注入普通 App 后 dyld 找不到 @rpath/CydiaSubstrate.framework 直接闪退。
+# 配合两个 .xm 顶部的 %config(generator=internal)，hook 走 objc runtime。
+AutoTapper_LIBRARIES =
+
 # GSEvent 旧后端默认关闭（iOS 15+ 的 purple port 已不再接受进程外事件）；
 # 需要在 iOS 13/14 上试旧路时可打开： make ... ADDITIONAL_CFLAGS=-DYG_ENABLE_GSEVENT=1
 AutoTapper_LDFLAGS = -undefined dynamic_lookup

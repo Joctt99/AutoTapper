@@ -32,6 +32,10 @@
 #import <objc/runtime.h>
 #import <string.h>
 
+// 侧载（证书签名）场景没有 CydiaSubstrate，用 Logos internal 生成器：
+// 生成的 hook 直接走 Objective-C runtime，产物不依赖任何注入框架。
+%config(generator=internal)
+
 #pragma mark - A. 窗口层级守护
 
 %group WindowGuard
