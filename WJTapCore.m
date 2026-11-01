@@ -135,7 +135,9 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
 @implementation WJTap {
     BOOL _started;
+    BOOL _uiReady;
     BOOL _retryScheduled;
+    NSInteger _retryCount;
 }
 
 + (instancetype)shared {
@@ -156,6 +158,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     }
     if (_started) return;
     _started = YES;
+    _uiReady = NO;
 
     WJLOG(@"==== AutoTapper bootstrap: app %@ (%@) ====",
           [NSBundle mainBundle].bundleIdentifier ?: @"?", reason);
@@ -170,21 +173,29 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     WJLOG(@"boot: install returned");
 }
 
-/// keyWindow 可能尚未就绪（启动早期），主线程重试最多 6 次（约 3 秒）
+/// 启动早期 keyWindow 可能尚未就绪：每 0.5s 检查一次，
+/// 窗口就绪立即补建 UI（_uiReady 置位后停止）；持续未就绪则降频打日志防刷屏。
 - (void)retrySetupIfNeeded {
-    if (_started && ![UIApplication sharedApplication].keyWindow) {
-        if (_retryScheduled) return;
-        _retryScheduled = YES;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            self->_retryScheduled = NO;
-            if (![UIApplication sharedApplication].keyWindow) {
-                WJLOG(@"retry: keyWindow still nil, re-setup");
-                [self setupUI];
-                [self retrySetupIfNeeded];
+    if (!_started || _uiReady) return;
+    if (_retryScheduled) return;
+    _retryScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        self->_retryScheduled = NO;
+        if (!self->_started || self->_uiReady) return;
+        UIWindow *w = [self hostWindow];
+        if (w) {
+            WJLOG(@"retry: window ready (was nil at boot), setup UI now");
+            [self setupUI];
+            if (!self->_uiReady) [self retrySetupIfNeeded];
+        } else {
+            self->_retryCount++;
+            if (self->_retryCount % 5 == 1) {
+                WJLOG(@"retry: window still nil (%ld)", (long)self->_retryCount);
             }
-        });
-    }
+            [self retrySetupIfNeeded];
+        }
+    });
 }
 
 #pragma mark - 悬浮 UI
@@ -247,6 +258,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
     [self loadPositionsFromFile];
     [self updateButtonsVisibility];
+    _uiReady = YES;
     WJLOG(@"setupUI: done dots=%ld", (long)self.dotButtons.count);
 }
 
