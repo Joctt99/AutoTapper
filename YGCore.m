@@ -120,54 +120,73 @@ static NSMutableArray<NSString *> *gLines = nil;
 /// UIWindowScene 的安全取值：优先前台 active，其次任意 connectedScene。
 /// ★ iOS 13+ 不许再用 [UIApplication sharedApplication].keyWindow，
 ///   它在多 scene / 分屏 / 画中画下返回 nil 或错的 window。
+/// ★ 防御式：App 启动早期 / iOS 26 场景未就绪时，枚举可能抛异常，
+///   一律 @try 捕获并回退 nil，绝不让「场景查询」成为崩溃点。
 static UIWindowScene *YGActiveWindowScene(void) {
-    UIApplication *app = UIApplication.sharedApplication;
-    if (!app) return nil;
+    @try {
+        UIApplication *app = UIApplication.sharedApplication;
+        if (!app) return nil;
 
-    NSSet<UIScene *> *scenes = app.connectedScenes;
-    if (![scenes isKindOfClass:[NSSet class]] || scenes.count == 0) return nil;
+        NSSet<UIScene *> *scenes = app.connectedScenes;
+        if (![scenes isKindOfClass:[NSSet class]] || scenes.count == 0) return nil;
 
-    UIWindowScene *best = nil;
-    NSInteger bestScore = -1;
+        UIWindowScene *best = nil;
+        NSInteger bestScore = -1;
 
-    for (UIScene *s in scenes) {
-        if (![s isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)s;
+        for (UIScene *s in scenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)s;
 
-        NSInteger score = 0;
-        if (ws.activationState == UISceneActivationStateForegroundActive) score += 100;
-        else if (ws.activationState == UISceneActivationStateForegroundInactive) score += 50;
-        else if (ws.activationState == UISceneActivationStateBackground) score += 1;
+            NSInteger score = 0;
+            if (ws.activationState == UISceneActivationStateForegroundActive) score += 100;
+            else if (ws.activationState == UISceneActivationStateForegroundInactive) score += 50;
+            else if (ws.activationState == UISceneActivationStateBackground) score += 1;
 
-        // 主屏优先（external display / CarPlay 也会是 UIWindowScene）
-        if ([ws.screen isEqual:UIScreen.mainScreen]) score += 20;
+            // 主屏优先（external display / CarPlay 也会是 UIWindowScene）
+            UIScreen *main = UIScreen.mainScreen;
+            if (main && [ws.screen isEqual:main]) score += 20;
 
-        if (score > bestScore) { bestScore = score; best = ws; }
+            if (score > bestScore) { bestScore = score; best = ws; }
+        }
+        return best;
+    } @catch (NSException *e) {
+        NSLog(@"[AutoTapper] YGActiveWindowScene exception: %@", e);
+        return nil;
     }
-    return best;
 }
 
 CGRect YGScreenBounds(void) {
-    // UIScreen.bounds 在 iOS 8+ 就是「当前界面方向」下的逻辑 point bounds，
-    // 比 deprecated 的 [UIScreen mainScreen].applicationFrame 更适合注入场景。
-    UIWindowScene *ws = YGActiveWindowScene();
-    if (ws) {
-        UIWindow *w = YGForegroundWindow();
-        if (w && w.bounds.size.width > 0 && w.bounds.size.height > 0) return w.bounds;
-        if (ws.coordinateSpace.bounds.size.width > 0) return ws.coordinateSpace.bounds;
+    // 防御式取值：任何一步失败立即回退，屏幕几何绝不当崩溃点。
+    @try {
+        // UIScreen.bounds 在 iOS 8+ 就是「当前界面方向」下的逻辑 point bounds，
+        // 比 deprecated 的 [UIScreen mainScreen].applicationFrame 更适合注入场景。
+        UIWindowScene *ws = YGActiveWindowScene();
+        if (ws) {
+            UIWindow *w = YGForegroundWindow();
+            if (w && w.bounds.size.width > 0 && w.bounds.size.height > 0) return w.bounds;
+            if (ws.coordinateSpace.bounds.size.width > 0) return ws.coordinateSpace.bounds;
+        }
+        UIScreen *main = UIScreen.mainScreen;
+        if (main) {
+            CGRect b = main.bounds;
+            if (b.size.width > 0 && b.size.height > 0) return b;
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[AutoTapper] YGScreenBounds exception: %@", e);
     }
-    CGRect b = UIScreen.mainScreen.bounds;
-    if (b.size.width <= 0 || b.size.height <= 0) {
-        // 极端情况下（注入过早，UIScreen 还没就绪）用 iPhone 13 Pro 的物理尺寸兜底
-        b = CGRectMake(0, 0, 390, 844);
-    }
-    return b;
+    // 极端情况下（注入过早，UIScreen 还没就绪）用 iPhone 13 Pro 的物理尺寸兜底
+    return CGRectMake(0, 0, 390, 844);
 }
 
 CGSize  YGScreenSize(void)  { return YGScreenBounds().size; }
 CGFloat YGScreenScale(void) {
-    CGFloat s = UIScreen.mainScreen.scale;
-    return s > 0 ? s : 3.0;
+    @try {
+        CGFloat s = UIScreen.mainScreen.scale;
+        return s > 0 ? s : 3.0;
+    } @catch (NSException *e) {
+        NSLog(@"[AutoTapper] YGScreenScale exception: %@", e);
+        return 3.0;
+    }
 }
 
 BOOL YGIsOverlayWindow(UIWindow *w) {
@@ -184,25 +203,29 @@ BOOL YGIsOverlayWindow(UIWindow *w) {
 }
 
 UIWindow *YGForegroundWindow(void) {
-    UIWindowScene *ws = YGActiveWindowScene();
-    if (ws) {
-        // windows 顺序是从「最底」到「最上」，倒序取第一个非本插件窗口
-        NSArray<UIWindow *> *wins = ws.windows;
-        for (NSInteger i = (NSInteger)wins.count - 1; i >= 0; i--) {
-            UIWindow *w = wins[i];
-            if (w.hidden || w.alpha < 0.01) continue;
+    @try {
+        UIWindowScene *ws = YGActiveWindowScene();
+        if (ws) {
+            // windows 顺序是从「最底」到「最上」，倒序取第一个非本插件窗口
+            NSArray<UIWindow *> *wins = ws.windows;
+            for (NSInteger i = (NSInteger)wins.count - 1; i >= 0; i--) {
+                UIWindow *w = wins[i];
+                if (w.hidden || w.alpha < 0.01) continue;
+                if (YGIsOverlayWindow(w)) continue;
+                if (w.windowLevel >= UIWindowLevelStatusBar) continue; // 系统 HUD
+                if (w.bounds.size.width <= 0) continue;
+                return w;
+            }
+        }
+        // 无 scene 的极老路径（iOS 12 及以下 / 部分注入上下文）
+        UIApplication *app = UIApplication.sharedApplication;
+        for (UIWindow *w in app.windows) {
             if (YGIsOverlayWindow(w)) continue;
-            if (w.windowLevel >= UIWindowLevelStatusBar) continue; // 系统 HUD
-            if (w.bounds.size.width <= 0) continue;
+            if (w.hidden) continue;
             return w;
         }
-    }
-    // 无 scene 的极老路径（iOS 12 及以下 / 部分注入上下文）
-    UIApplication *app = UIApplication.sharedApplication;
-    for (UIWindow *w in app.windows) {
-        if (YGIsOverlayWindow(w)) continue;
-        if (w.hidden) continue;
-        return w;
+    } @catch (NSException *e) {
+        NSLog(@"[AutoTapper] YGForegroundWindow exception: %@", e);
     }
     return nil;
 }

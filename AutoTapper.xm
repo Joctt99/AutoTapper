@@ -59,14 +59,18 @@ static void YGInstallOrientationHook(void);
           reason, [self isSpringBoard]);
     YGLOG(@"device=%@ system=%@", [UIDevice currentDevice].model,
           [UIDevice currentDevice].systemVersion);
-    YGLOG(@"screen=%@ scale=%.1f", NSStringFromCGRect(YGScreenBounds()), YGScreenScale());
 
-    // 1) 私有符号 / 后端探测
+    // 1) 私有符号 / 后端探测（纯 dlsym，不碰 UIKit，绝对安全）
     [[YGInjector shared] probe];
     // 启动环境摘要：日志路径 + 后端可用矩阵，一眼定位问题
     [YGLog logEnvironment];
 
-    // 2) 悬浮 UI
+    // 2) 屏幕几何（防御式函数，异常自动回退，不会崩）
+    CGRect sb = YGScreenBounds();
+    CGFloat ss = YGScreenScale();
+    YGLOG(@"screen=%@ scale=%.1f", NSStringFromCGRect(sb), ss);
+
+    // 3) 悬浮 UI
     [[YGOverlayController shared] install];
 
     // 3) 音量减键（仅 SpringBoard 有意义：App 进程里收不到系统级按键）
@@ -140,12 +144,30 @@ static void YGInstallOrientationHook(void);
         YGLOG(@"tweak loaded into %@", bid.length ? bid : @"?");
 
         // 非 SpringBoard 进程（plist 里额外加了 App 时才会走到）：
-        // UIApplication 已经存在，直接装。
-        // 用 main queue 异步，避免在 dyld 初始化阶段碰 UIKit。
+        // 等 UIApplicationDidFinishLaunching 后再装，避开 App 启动早期
+        // UIKit 场景未就绪（iOS 26 上此时枚举 connectedScenes 会崩）。
+        // 3 秒兜底：万一通知已错过，强制启动。
         if (![bid isEqualToString:@"com.apple.springboard"]) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [[YGBootstrap shared] startWithReason:
-                    [NSString stringWithFormat:@"app %@", bid]];
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{
+                    __block id obs = nil;
+                    void (^start)(void) = ^{
+                        [[NSNotificationCenter defaultCenter] removeObserver:obs];
+                        NSString *bid2 = [NSBundle mainBundle].bundleIdentifier ?: @"?";
+                        [[YGBootstrap shared] startWithReason:
+                            [NSString stringWithFormat:@"app %@ (didFinishLaunching)", bid2]];
+                    };
+                    obs = [[NSNotificationCenter defaultCenter]
+                        addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                    object:nil queue:[NSOperationQueue mainQueue]
+                                usingBlock:^(NSNotification *n) { start(); }];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(3 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        if (![YGBootstrap shared].started) start();
+                    });
+                });
             });
         }
     }
