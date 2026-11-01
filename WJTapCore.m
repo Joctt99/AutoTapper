@@ -985,7 +985,22 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     self.shouldHideButtons = [ud boolForKey:@"WJHookShouldHideButtons"];
     self.buttonSize = [ud floatForKey:@"WJHookButtonSize"];
     if (self.buttonSize == 0) self.buttonSize = 80;
-    self.attackMode = [ud integerForKey:@"WJHookAttackMode"];
+    // 攻击模式：v12 起语义 0=开关 1=滑动 2=隐藏；v11 及以前 0=按住 1=切换 2=隐藏
+    // 首次运行 v12 时做一次性迁移，保证旧设置行为不变、新装默认开关模式
+    if (![ud boolForKey:@"WJHookAttackModeMigratedV12"]) {
+        if ([ud objectForKey:@"WJHookAttackMode"]) {
+            NSInteger legacy = [ud integerForKey:@"WJHookAttackMode"];
+            if (legacy == 0) self.attackMode = 1;        // 旧"按住" → 新"滑动"（行为一致）
+            else if (legacy == 1) self.attackMode = 0;   // 旧"切换" → 新"开关"（行为一致）
+            else self.attackMode = 2;                    // 隐藏不变
+        } else {
+            self.attackMode = 0;                          // 新装：默认开关
+        }
+        [ud setBool:YES forKey:@"WJHookAttackModeMigratedV12"];
+        [ud synchronize];
+    } else {
+        self.attackMode = [ud integerForKey:@"WJHookAttackMode"];
+    }
     self.dotAlpha = [ud floatForKey:@"WJHookDotAlpha"];
     if (self.dotAlpha == 0) self.dotAlpha = 0.7;
     self.dotSize = [ud floatForKey:@"WJHookDotSize"];
@@ -1023,6 +1038,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     [ud setBool:self.shouldHideButtons forKey:@"WJHookShouldHideButtons"];
     [ud setFloat:(float)self.buttonSize forKey:@"WJHookButtonSize"];
     [ud setInteger:self.attackMode forKey:@"WJHookAttackMode"];
+    [ud setBool:YES forKey:@"WJHookAttackModeMigratedV12"];   // 已进入 v12 新语义，停止迁移
     [ud setFloat:(float)self.dotAlpha forKey:@"WJHookDotAlpha"];
     [ud setFloat:(float)self.dotSize forKey:@"WJHookDotSize"];
     [ud setFloat:(float)self.settingsButtonAlpha forKey:@"WJHookSettingsButtonAlpha"];
