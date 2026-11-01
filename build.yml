@@ -1,0 +1,174 @@
+name: build
+
+# Windows 本机没有 Theos 时，用这条流水线在云端把 deb / dylib 编出来。
+# push 到 main、开 PR、或在 Actions 页面点 "Run workflow" 都会跑。
+# 产物在本次 run 页面底部的 Artifacts 里下载。
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支只保留最新一次，避免排队浪费额度
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Theos 没有语义化版本 tag（最新只到 2.5，之后一直是 master），
+  # 所以固定到具体 commit，避免上游改动让构建某天突然红掉。
+  THEOS_SHA: 304e0799973e8145f32e4ca2de6c747a84b758ce
+
+jobs:
+  theos:
+    name: theos-package (iOS 17 / arm64)
+    runs-on: macos-13
+    timeout-minutes: 30
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- 1. 依赖：ldid（签名）、xz（deb 压缩）、dpkg（打包） -----------
+      - name: Install tooling
+        run: |
+          set -euo pipefail
+          need=()
+          command -v ldid  >/dev/null 2>&1 || need+=(ldid)
+          command -v xz    >/dev/null 2>&1 || need+=(xz)
+          command -v dpkg-deb >/dev/null 2>&1 || need+=(dpkg)
+          if [ ${#need[@]} -gt 0 ]; then
+            echo "brew install ${need[*]}"
+            brew install "${need[@]}"
+          fi
+          echo "--- versions ---"
+          ldid -h 2>&1 | head -2 || ldid --version 2>&1 | head -2 || true
+          xz --version | head -1
+          dpkg-deb --version | head -1
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # --- 2. Theos（固定 SHA + 递归子模块） -----------------------------
+      - name: Clone Theos @ ${{ env.THEOS_SHA }}
+        run: |
+          set -euo pipefail
+          # 先尝试按 SHA 精确拉取（可复现）；失败则退回 master
+          if git init -q "$THEOS" 2>/dev/null \
+             && cd "$THEOS" \
+             && git remote add origin https://github.com/theos/theos.git \
+             && git fetch -q --depth 1 origin "$THEOS_SHA" \
+             && git checkout -q FETCH_HEAD; then
+            echo "按 SHA 检出成功"
+          else
+            echo "::warning::按 SHA 拉取失败，退回 master"
+            rm -rf "$THEOS"
+            git clone -q --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+            cd "$THEOS"
+          fi
+          git submodule update --init --recursive --depth 1 --quiet
+          test -f makefiles/common.mk
+          test -d vendor/logos
+          echo "Theos HEAD: $(git rev-parse HEAD)"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      # --- 3. iOS SDK：优先用 runner 上 Xcode 自带的（最新最准，arm64e 干净） ---
+      - name: Prepare iOS SDK
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/sdks"
+
+          XC_SDK="$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)"
+          XC_VER="$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)"
+
+          if [ -n "${XC_SDK:-}" ] && [ -d "$XC_SDK" ]; then
+            echo "Xcode SDK: iPhoneOS$XC_VER -> $XC_SDK"
+            # Theos 按 iPhoneOS<版本>.sdk 命名目录；软链即可，不占空间
+            ln -sfn "$XC_SDK" "$THEOS/sdks/iPhoneOS$XC_VER.sdk"
+          else
+            echo "::warning::runner 上没有 iPhoneOS SDK，回退到 theos/sdks"
+            git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+            # 只搬需要的两个版本，别把整仓 5 万文件都拷进去
+            for v in iPhoneOS16.5 iPhoneOS15.6; do
+              [ -d "/tmp/theos-sdks/$v.sdk" ] && \
+                cp -R "/tmp/theos-sdks/$v.sdk" "$THEOS/sdks/$v.sdk"
+            done
+          fi
+
+          echo "--- sdks ---"
+          ls -1 "$THEOS/sdks"
+
+      # --- 4. 离线自检（括号 / 选择子 / 符号），省一次云端重编 -------------
+      - name: Offline self-checks
+        run: |
+          set -euo pipefail
+          for s in balance_check sel_check sym_check; do
+            echo "===== $s ====="
+            python3 "tools/$s.py"
+          done
+
+      # --- 5. 编译打包 ---------------------------------------------------
+      - name: Build package
+        run: |
+          set -euo pipefail
+          make clean >/dev/null 2>&1 || true
+          set -o pipefail
+          make package FINALPACKAGE=1 2>&1 | tee /tmp/build.log
+          ls -l packages/
+
+      # --- 6. 产物校验：架构 / 签名 / 包内容 ------------------------------
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          DY="$(ls .theos/obj/AutoTapper.dylib 2>/dev/null || ls .theos/obj/*/AutoTapper.dylib | head -1)"
+          echo "dylib: $DY"
+
+          echo "--- 架构（侧载场景只需 arm64；arm64e 在新工具链+老系统上 ABI 不兼容，已停编）---"
+          lipo -info "$DY" | tee /tmp/lipo.txt
+          grep -q 'arm64'  /tmp/lipo.txt || { echo "::error::缺少 arm64 切片";  exit 1; }
+
+          echo "--- 签名（ldid 写入的 entitlements，可为空）---"
+          ldid -e "$DY" 2>/dev/null | head -20 || echo "(无 entitlements，正常)"
+
+          echo "--- 最低系统版本 ---"
+          otool -l "$DY" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN' | head -12
+
+          echo "--- dylib 依赖 ---"
+          otool -L "$DY" | head -20
+
+          echo "--- deb 内容 ---"
+          dpkg-deb -c packages/*.deb
+          echo "--- deb control ---"
+          dpkg-deb -I packages/*.deb | head -20
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoTapper-deb
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoTapper-dylib
+          path: |
+            .theos/obj/AutoTapper.dylib
+            .theos/obj/*/AutoTapper.dylib
+          if-no-files-found: warn
+          retention-days: 30
