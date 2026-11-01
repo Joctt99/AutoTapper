@@ -13,7 +13,10 @@
 # ===========================================================================
 
 export TARGET       = iphone:clang:latest:13.0
-export ARCHS        = arm64 arm64e
+# 只编 arm64：arm64e 切片需要 iOS >= 14，且新工具链的 arm64e 有 PAC 密钥
+# 兼容问题（老系统上加载即崩）。arm64e 设备（A12+）完全兼容运行纯 arm64
+# 二进制，功能无差别。侧载场景不需要 arm64e。
+export ARCHS        = arm64
 export THEOS_PACKAGE_SCHEME = rootless
 export DEBUG        = 0
 

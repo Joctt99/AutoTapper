@@ -127,6 +127,10 @@ static void YGInstallOrientationHook(void);
 
 %ctor {
     @autoreleasepool {
+        // 诊断锚点：NSLog 走系统日志（os_log），不需要沙盒文件权限。
+        // 若 dyld 加载失败，这条不会出现 → 问题在签名/注入路径；
+        // 若出现后仍闪退 → 问题在执行期，可据此定位。
+        NSLog(@"[AutoTapper] ctor begin");
         // 配置先读出来（后续 UI 直接用）
         [YGConfig shared];
         // 符号探测（纯 dlsym，安全）
