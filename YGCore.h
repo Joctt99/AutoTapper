@@ -54,6 +54,7 @@ extern NSString *const YGTapEngineDidFailStartNotification;
 + (NSString *)logPath;
 + (void)clear;
 + (NSArray<NSString *> *)recentLines;
++ (void)logEnvironment;
 @end
 
 #pragma mark - 几何 / 屏幕

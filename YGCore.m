@@ -44,7 +44,7 @@ static NSMutableArray<NSString *> *gLines = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         df = [[NSDateFormatter alloc] init];
-        df.dateFormat = @"HH:mm:ss.SSS";
+        df.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
     });
 
     NSString *line = [NSString stringWithFormat:@"%@ %@",
@@ -55,6 +55,17 @@ static NSMutableArray<NSString *> *gLines = nil;
     if (gLines.count > kYGBufferLines) {
         [gLines removeObjectsInRange:NSMakeRange(0, gLines.count - kYGBufferLines)];
     }
+    // 日志轮转：超过阈值自动归档为 AutoTapper.log.1，避免文件无限膨胀
+    static const unsigned long long kYGRotateBytes = 256 * 1024;
+    NSDictionary *attrs = [[NSFileManager defaultManager]
+                             attributesOfItemAtPath:gLogPath error:NULL];
+    if (attrs && [attrs fileSize] >= kYGRotateBytes) {
+        NSString *oldPath = [gLogPath stringByAppendingString:@".1"];
+        [[NSFileManager defaultManager] removeItemAtPath:oldPath error:NULL];
+        [[NSFileManager defaultManager] moveItemAtPath:gLogPath toPath:oldPath error:NULL];
+        NSLog(@"[AutoTapper] 日志已轮转 -> AutoTapper.log.1");
+    }
+
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
     if (!fh) {
         [[line stringByAppendingString:@"\n"]
@@ -86,6 +97,20 @@ static NSMutableArray<NSString *> *gLines = nil;
     [gLines removeAllObjects];
     [[NSFileManager defaultManager] removeItemAtPath:gLogPath error:NULL];
     [gLogLock unlock];
+}
+
+/// 启动环境摘要：日志路径 / 注入进程 / 后端可用矩阵，一次打印便于排查
++ (void)logEnvironment {
+    YGLOG(@"==== environment summary ====");
+    YGLOG(@"log file: %@", gLogPath ?: @"?");
+    YGLOG(@"home: %@", NSHomeDirectory());
+    YGLOG(@"bundle id: %@", [NSBundle mainBundle].bundleIdentifier ?: @"?");
+    YGInjector *inj = [YGInjector shared];
+    YGLOG(@"backend availability: HID=%d SPRINGHID=%d UITOUCH=%d GSEVENT=%d",
+          inj.hidAvailable, inj.springHIDAvailable, inj.uiTouchAvailable,
+          inj.gsEventAvailable);
+    YGLOG(@"active backend: %@", inj.activeBackendName ?: @"(none)");
+    YGLOG(@"==== end environment summary ====");
 }
 
 @end

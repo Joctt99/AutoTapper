@@ -59,6 +59,8 @@ static void YGInstallOrientationHook(void);
 
     // 1) 私有符号 / 后端探测
     [[YGInjector shared] probe];
+    // 启动环境摘要：日志路径 + 后端可用矩阵，一眼定位问题
+    [YGLog logEnvironment];
 
     // 2) 悬浮 UI
     [[YGOverlayController shared] install];
