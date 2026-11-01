@@ -90,6 +90,11 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     WJTagQuickReturnSwitch   = 1012,
     WJTagSaveButton          = 1013,
     WJTagCloseButton         = 1014,
+    WJTagSteerProtectSwitch  = 1015,
+    WJTagSteerXSlider        = 1016,
+    WJTagSteerYSlider        = 1017,
+    WJTagSteerWSlider        = 1018,
+    WJTagSteerHSlider        = 1019,
 };
 
 #pragma mark - WJTap
@@ -119,6 +124,13 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 @property (nonatomic, assign) BOOL enableQuickMount;
 @property (nonatomic, assign) BOOL enableQuickReviveMount;
 @property (nonatomic, assign) BOOL enableQuickReturnCityMount;
+
+// 方向盘免干扰（游戏优先级）：
+//  steerRect = 游戏内虚拟方向盘/摇杆区域（window 坐标，默认左下角）。
+//  该区域内：连点器模拟点击一律让位；dot 自动隐藏避免挡手。
+@property (nonatomic, assign) BOOL steerProtectEnabled;
+@property (nonatomic, assign) CGRect steerRect;
+@property (nonatomic, strong) UIView *steerFrameView;
 @end
 
 @implementation WJTap {
@@ -222,9 +234,52 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
     [self createSettingsButtonInWindow:window];
     [self createDotButtonsWithRadius:100.0 dotSize:self.dotSize inWindow:window dotCount:self.dotCount];
+
+    // 方向盘免干扰：区域未保存过时按常见位置（左下角）补全默认值
+    if (![self steerRectWasConfigured]) {
+        self.steerRect = CGRectMake(10,
+                                    window.bounds.size.height - 190,
+                                    160, 160);
+        [self saveSettings];
+        WJLOG(@"steer: default rect %@", NSStringFromCGRect(self.steerRect));
+    }
+    [self setupSteerFrameViewInWindow:window];
+
     [self loadPositionsFromFile];
     [self updateButtonsVisibility];
     WJLOG(@"setupUI: done dots=%ld", (long)self.dotButtons.count);
+}
+
+- (BOOL)steerRectWasConfigured {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    return ([ud objectForKey:@"WJHookSteerX"] != nil &&
+            [ud objectForKey:@"WJHookSteerY"] != nil);
+}
+
+/// 方向盘保护区域可视化框：半透明描边，userInteractionEnabled=NO 完全透传触摸
+- (void)setupSteerFrameViewInWindow:(UIWindow *)window {
+    if (self.steerFrameView) {
+        [self.steerFrameView removeFromSuperview];
+        self.steerFrameView = nil;
+    }
+    UIView *v = [[UIView alloc] initWithFrame:self.steerRect];
+    v.backgroundColor = [UIColor colorWithWhite:0.95 alpha:0.05];
+    v.layer.borderWidth = 2.0;
+    v.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.55].CGColor;
+    v.layer.cornerRadius = 10;
+    v.userInteractionEnabled = NO;   // 透传：不挡游戏方向盘的真实触摸
+    v.hidden = !self.steerProtectEnabled;
+    self.steerFrameView = v;
+    [window addSubview:v];
+    // 放到悬浮按钮之下，避免视觉遮挡
+    [window sendSubviewToBack:v];
+    WJLOG(@"steer frame: %@ hidden=%d", NSStringFromCGRect(v.frame), v.hidden);
+}
+
+- (void)updateSteerFrame {
+    self.steerFrameView.frame = self.steerRect;
+    self.steerFrameView.hidden = !self.steerProtectEnabled;
+    [self updateButtonsVisibility];
 }
 
 - (void)addDragHandleToAttackButton {
@@ -420,6 +475,8 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
         [g setTranslation:CGPointZero inView:dot.superview];
     } else if (g.state == UIGestureRecognizerStateEnded) {
         [self savePositionsToFile];
+        // dot 位置变了，重新评估方向盘区域避让
+        [self updateButtonsVisibility];
     }
 }
 
@@ -570,6 +627,10 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     if (!self.isVerified) return;
     UIWindow *window = [self hostWindow];
     if (!window) return;
+    // 游戏优先级：方向盘区域内的模拟点击一律让位（真实手控移动优先）
+    if (self.steerProtectEnabled && CGRectContainsPoint(self.steerRect, point)) {
+        return;
+    }
     UIView *hit = [window hitTest:point withEvent:nil];
     if (!hit) return;
     if ([self isOwnFloatingView:hit]) return;
@@ -606,7 +667,12 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
         self.attackButton.hidden = YES;
         for (UIButton *d in self.dotButtons) d.hidden = YES;
     } else {
-        for (UIButton *d in self.dotButtons) d.hidden = NO;
+        // dot 落在方向盘保护区域内时自动隐藏，避免挡住真实触摸移动
+        for (UIButton *d in self.dotButtons) {
+            BOOL inSteer = self.steerProtectEnabled &&
+                           CGRectContainsPoint(self.steerRect, d.center);
+            d.hidden = inSteer;
+        }
         if (self.attackMode == 2) {
             self.attackButton.hidden = YES;
         } else {
@@ -630,7 +696,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     CGFloat rowH = 44;
     CGFloat pad = 12;
     CGFloat top = 14;
-    CGFloat h = top + 12 * rowH + 70;
+    CGFloat h = top + 17 * rowH + 70;
     if (h > window.bounds.size.height - 40) h = window.bounds.size.height - 40;
 
     UIScrollView *panel = [[UIScrollView alloc] initWithFrame:
@@ -735,6 +801,39 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     [qc addTarget:self action:@selector(quickReturnCityMountSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     addRow(@"快捷回城", qc);
 
+    // ---- 方向盘免干扰（游戏优先级） ----
+    UISwitch *steerSw = [UISwitch new];
+    steerSw.on = self.steerProtectEnabled; steerSw.tag = WJTagSteerProtectSwitch;
+    [steerSw addTarget:self action:@selector(steerProtectSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"方向盘免干扰", steerSw);
+
+    CGFloat bw = window.bounds.size.width;
+    CGFloat bh = window.bounds.size.height;
+
+    UISlider *sx = [UISlider new];
+    sx.minimumValue = 0; sx.maximumValue = bw;
+    sx.value = self.steerRect.origin.x; sx.tag = WJTagSteerXSlider;
+    [sx addTarget:self action:@selector(steerXSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"方向盘X", sx);
+
+    UISlider *sy = [UISlider new];
+    sy.minimumValue = 0; sy.maximumValue = bh;
+    sy.value = self.steerRect.origin.y; sy.tag = WJTagSteerYSlider;
+    [sy addTarget:self action:@selector(steerYSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"方向盘Y", sy);
+
+    UISlider *sw2 = [UISlider new];
+    sw2.minimumValue = 80; sw2.maximumValue = 240;
+    sw2.value = self.steerRect.size.width; sw2.tag = WJTagSteerWSlider;
+    [sw2 addTarget:self action:@selector(steerWSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"方向盘宽", sw2);
+
+    UISlider *sh2 = [UISlider new];
+    sh2.minimumValue = 80; sh2.maximumValue = 240;
+    sh2.value = self.steerRect.size.height; sh2.tag = WJTagSteerHSlider;
+    [sh2 addTarget:self action:@selector(steerHSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    addRow(@"方向盘高", sh2);
+
     // 保存 + 关闭
     UIButton *save = [UIButton buttonWithType:UIButtonTypeRoundedRect];
     [save setTitle:@"保存" forState:UIControlStateNormal];
@@ -818,6 +917,34 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 - (void)quickReviveMountSwitchChanged:(UISwitch *)sw { self.enableQuickReviveMount = sw.on; }
 - (void)quickReturnCityMountSwitchChanged:(UISwitch *)sw { self.enableQuickReturnCityMount = sw.on; }
 
+// ---- 方向盘免干扰回调 ----
+- (void)steerProtectSwitchChanged:(UISwitch *)sw {
+    self.steerProtectEnabled = sw.on;
+    WJLOG(@"steer protect %@ rect=%@", sw.on ? @"ON" : @"OFF",
+          NSStringFromCGRect(self.steerRect));
+    [self updateSteerFrame];
+}
+- (void)steerXSliderChanged:(UISlider *)s {
+    self.steerRect = CGRectMake(s.value, self.steerRect.origin.y,
+                                self.steerRect.size.width, self.steerRect.size.height);
+    [self updateSteerFrame];
+}
+- (void)steerYSliderChanged:(UISlider *)s {
+    self.steerRect = CGRectMake(self.steerRect.origin.x, s.value,
+                                self.steerRect.size.width, self.steerRect.size.height);
+    [self updateSteerFrame];
+}
+- (void)steerWSliderChanged:(UISlider *)s {
+    self.steerRect = CGRectMake(self.steerRect.origin.x, self.steerRect.origin.y,
+                                s.value, self.steerRect.size.height);
+    [self updateSteerFrame];
+}
+- (void)steerHSliderChanged:(UISlider *)s {
+    self.steerRect = CGRectMake(self.steerRect.origin.x, self.steerRect.origin.y,
+                                self.steerRect.size.width, s.value);
+    [self updateSteerFrame];
+}
+
 - (void)updateAttackButtonSize {
     self.attackButton.frame = CGRectMake(0, 0, self.buttonSize, self.buttonSize);
     self.attackButton.layer.cornerRadius = self.buttonSize / 2.0;
@@ -853,8 +980,23 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     self.enableQuickReviveMount = [ud boolForKey:@"WJHookEnableQuickReviveMount"];
     self.enableQuickReturnCityMount = [ud boolForKey:@"WJHookEnableQuickReturnCityMount"];
     self.enableQuickMount = [ud boolForKey:@"WJHookEnableQuickMount"];
-    WJLOG(@"settings loaded: interval=%.2f dots=%ld mode=%ld", self.clickInterval,
-          (long)self.dotCount, (long)self.attackMode);
+
+    // 方向盘免干扰：默认开启，区域默认左下角（setupUI 里按窗口尺寸补全）
+    if ([ud objectForKey:@"WJHookSteerProtectEnabled"]) {
+        self.steerProtectEnabled = [ud boolForKey:@"WJHookSteerProtectEnabled"];
+    } else {
+        self.steerProtectEnabled = YES;
+    }
+    CGFloat sx = [ud floatForKey:@"WJHookSteerX"];
+    CGFloat sy = [ud floatForKey:@"WJHookSteerY"];
+    CGFloat sw = [ud floatForKey:@"WJHookSteerW"];
+    CGFloat sh = [ud floatForKey:@"WJHookSteerH"];
+    self.steerRect = CGRectMake(sx, sy, sw > 0 ? sw : 160, sh > 0 ? sh : 160);
+
+    WJLOG(@"settings loaded: interval=%.2f dots=%ld mode=%ld steer=%@ rect=%@",
+          self.clickInterval, (long)self.dotCount, (long)self.attackMode,
+          self.steerProtectEnabled ? @"ON" : @"OFF",
+          NSStringFromCGRect(self.steerRect));
 }
 
 - (void)saveSettings {
@@ -871,6 +1013,11 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     [ud setBool:self.enableQuickReviveMount forKey:@"WJHookEnableQuickReviveMount"];
     [ud setBool:self.enableQuickReturnCityMount forKey:@"WJHookEnableQuickReturnCityMount"];
     [ud setBool:self.enableQuickMount forKey:@"WJHookEnableQuickMount"];
+    [ud setBool:self.steerProtectEnabled forKey:@"WJHookSteerProtectEnabled"];
+    [ud setFloat:(float)self.steerRect.origin.x forKey:@"WJHookSteerX"];
+    [ud setFloat:(float)self.steerRect.origin.y forKey:@"WJHookSteerY"];
+    [ud setFloat:(float)self.steerRect.size.width forKey:@"WJHookSteerW"];
+    [ud setFloat:(float)self.steerRect.size.height forKey:@"WJHookSteerH"];
     [ud synchronize];
 }
 
