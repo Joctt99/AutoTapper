@@ -109,7 +109,6 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 @property (nonatomic, strong) UIScrollView *settingsPanel;
 @property (nonatomic, strong) UIPanGestureRecognizer *handlePanGesture;
 @property (nonatomic, strong) UIPanGestureRecognizer *settingsPanGesture;
-@property (nonatomic, strong) UILabel *titleLabel;   // 顶部悬浮标题
 @property (nonatomic, assign) BOOL isVerified;
 
 // 设置项
@@ -226,8 +225,6 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 
     self.isVerified = YES;   // 无验证机制：始终视为已验证
 
-    [self createTitleLabelInWindow:window];
-
     // --- 攻击按钮（红色圆形） ---
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, self.buttonSize, self.buttonSize);
@@ -292,28 +289,6 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     // 放到悬浮按钮之下，避免视觉遮挡
     [window sendSubviewToBack:v];
     WJLOG(@"steer frame: %@ hidden=%d", NSStringFromCGRect(v.frame), v.hidden);
-}
-
-- (void)createTitleLabelInWindow:(UIWindow *)window {
-    UILabel *lab = [[UILabel alloc] init];
-    lab.text = @"老玩家连点";
-    lab.font = [UIFont boldSystemFontOfSize:18];
-    lab.textColor = [UIColor whiteColor];
-    lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
-    lab.layer.cornerRadius = 12;
-    lab.layer.masksToBounds = YES;
-    lab.textAlignment = NSTextAlignmentCenter;
-    lab.userInteractionEnabled = NO;   // 完全透传触摸，不挡游戏操作
-    [lab sizeToFit];
-    CGRect f = lab.frame;
-    f.size.width += 28;
-    f.size.height = 32;
-    lab.frame = f;
-    lab.center = CGPointMake(window.bounds.size.width / 2.0, 64);
-    self.titleLabel = lab;
-    [window addSubview:lab];
-    [window bringSubviewToFront:lab];
-    WJLOG(@"title label: %@", NSStringFromCGRect(lab.frame));
 }
 
 - (void)updateSteerFrame {
@@ -611,6 +586,13 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 }
 
 - (void)scheduleClicks {
+    // 轮次摘要（限频 1s 一条）：确认每轮实际派发多少个点位
+    static NSTimeInterval lastRoundLog = 0;
+    NSTimeInterval nowTick = CACurrentMediaTime();
+    if (nowTick - lastRoundLog >= 1.0) {
+        lastRoundLog = nowTick;
+        WJLOG(@"round: %ld dots @ %.0fms", (long)self.dotButtons.count, self.clickInterval * 1000.0);
+    }
     for (UIButton *dot in self.dotButtons) {
         NSBlockOperation *op = [NSBlockOperation blockOperationWithBlock:^{
             usleep(arc4random_uniform(2) * 5000);   // 毫秒级：0~5ms 随机微延迟
@@ -665,6 +647,18 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     }
 }
 
+/// 点击派发诊断日志：限频输出（0.5s 最多一条），避免高频连点刷爆日志
+- (void)logTapDiagnostics:(CGPoint)point hit:(UIView *)hit note:(NSString *)note {
+    static NSTimeInterval lastTapLog = 0;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - lastTapLog < 0.5) return;
+    lastTapLog = now;
+    WJLOG(@"tap %@ note=%@ hit=%@ control=%d",
+          NSStringFromCGPoint(point), note,
+          hit ? NSStringFromClass([hit class]) : @"-",
+          hit ? ([hit isKindOfClass:[UIControl class]] ? 1 : 0) : 0);
+}
+
 /// 连点引擎是否命中自己悬浮控件（dot/攻击钮/设置钮）——命中则跳过，
 /// 避免 hitTest → sendActions → handleDotTap 的自触发循环刷屏/失控。
 - (BOOL)isOwnFloatingView:(UIView *)view {
@@ -679,14 +673,25 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 - (void)simulateTapAtPoint:(CGPoint)point {
     if (!self.isVerified) return;
     UIWindow *window = [self hostWindow];
-    if (!window) return;
+    if (!window) {
+        [self logTapDiagnostics:point hit:nil note:@"no-window"];
+        return;
+    }
     // 游戏优先级：方向盘区域内的模拟点击一律让位（真实手控移动优先）
     if (self.steerProtectEnabled && CGRectContainsPoint(self.steerRect, point)) {
+        [self logTapDiagnostics:point hit:nil note:@"steer-blocked"];
         return;
     }
     UIView *hit = [window hitTest:point withEvent:nil];
-    if (!hit) return;
-    if ([self isOwnFloatingView:hit]) return;
+    if (!hit) {
+        [self logTapDiagnostics:point hit:nil note:@"no-hit"];
+        return;
+    }
+    if ([self isOwnFloatingView:hit]) {
+        [self logTapDiagnostics:point hit:hit note:@"own-view"];
+        return;
+    }
+    [self logTapDiagnostics:point hit:hit note:@"ok"];
 
     if (![hit isKindOfClass:[UIControl class]]) {
         @try {
@@ -749,7 +754,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     CGFloat rowH = 44;
     CGFloat pad = 12;
     CGFloat top = 14;
-    CGFloat h = top + 17 * rowH + 70;
+    CGFloat h = top + 36 + 17 * rowH + 70;   // 36 = 顶部标题区高度
     // 面板过高时压缩可视高度，内容仍完整可滚动（UIScrollView）
     CGFloat maxH = window.bounds.size.height * 0.62;
     if (h > maxH) h = maxH;
@@ -765,7 +770,15 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
     [window addSubview:panel];
     [window bringSubviewToFront:panel];
 
-    __block CGFloat y = top;
+    // 面板顶部标题
+    UILabel *panelTitle = [[UILabel alloc] initWithFrame:CGRectMake(0, top, w, 34)];
+    panelTitle.text = @"老玩家连点";
+    panelTitle.textColor = [UIColor whiteColor];
+    panelTitle.font = [UIFont boldSystemFontOfSize:18];
+    panelTitle.textAlignment = NSTextAlignmentCenter;
+    [panel addSubview:panelTitle];
+
+    __block CGFloat y = top + 36;
 
     void (^addRow)(NSString *, UIView *) = ^(NSString *title, UIView *ctrl) {
         UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, 96, rowH)];
@@ -1045,7 +1058,7 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
 - (void)loadSettings {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     self.clickInterval = [ud floatForKey:@"WJHookClickInterval"];
-    if (self.clickInterval == 0) self.clickInterval = 0.1;
+    if (self.clickInterval == 0) self.clickInterval = 0.05;   // 默认 50ms（毫秒级连点）
     self.dotCount = [ud integerForKey:@"WJHookDotCount"];
     if (self.dotCount == 0) self.dotCount = 6;
     self.shouldHideButtons = [ud boolForKey:@"WJHookShouldHideButtons"];
