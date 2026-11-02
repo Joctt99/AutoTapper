@@ -682,13 +682,18 @@ typedef NS_ENUM(NSInteger, WJTapControlTag) {
         [self logTapDiagnostics:point hit:nil note:@"steer-blocked"];
         return;
     }
-    UIView *hit = [window hitTest:point withEvent:nil];
+    // 关键修复：模拟点击必须绕过自己的悬浮控件（dot 点位按钮/攻钮/设置钮/面板）。
+    // 实测日志证实 hitTest 命中点位自己的 UIButton（note=own-view）→ 点击被拦截丢弃，
+    // 游戏永远收不到 → 表现为"开关无效/速度没变化"。改为逐层向游戏内容 hitTest：
+    // 跳过 own floating subview，命中下层游戏视图，再把事件派发给游戏视图。
+    UIView *hit = nil;
+    for (UIView *sub in [window.subviews reverseObjectEnumerator]) {
+        if ([self isOwnFloatingView:sub]) continue;
+        hit = [sub hitTest:point withEvent:nil];
+        if (hit) break;
+    }
     if (!hit) {
         [self logTapDiagnostics:point hit:nil note:@"no-hit"];
-        return;
-    }
-    if ([self isOwnFloatingView:hit]) {
-        [self logTapDiagnostics:point hit:hit note:@"own-view"];
         return;
     }
     [self logTapDiagnostics:point hit:hit note:@"ok"];
