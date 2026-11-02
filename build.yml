@@ -20,7 +20,7 @@ env:
 jobs:
   theos:
     name: theos-package (iOS 17 / arm64)
-    runs-on: macos-15-intel
+    runs-on: macos-26-intel
     timeout-minutes: 30
     env:
       THEOS: ${{ github.workspace }}/theos
